@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import sys
 import json
 import time
 import struct
@@ -19,6 +20,7 @@ from gpiozero import Button
 import digitalio
 import adafruit_vl53l1x
 from picamera2 import Picamera2
+from libcamera import Transform, controls
 from ultralytics import YOLO
 
 import board
@@ -36,7 +38,10 @@ USE_MOTOR = True
 USE_X120X = True
 USE_TOF = True
 
-SHOW_CAMERA_WINDOW = True
+# Show the OpenCV preview window only when a desktop display is available.
+# When started by systemd at boot there is no DISPLAY, so this turns off
+# automatically and cv2.imshow() is never called.
+SHOW_CAMERA_WINDOW = bool(os.environ.get("DISPLAY"))
 
 
 # =========================================================
@@ -63,8 +68,35 @@ CHAR_UUID = "12345678-1234-5678-1234-56789abcdef1"
 WIDTH = 640
 HEIGHT = 640
 
+# Picamera2 main stream (letterboxed to WIDTH x HEIGHT for YOLO).
+CAMERA_SIZE = (640, 480)
+CAMERA_FORMAT = "RGB888"
+# Camera is mounted upside down -> rotate 180 degrees.
+CAMERA_HFLIP = True
+CAMERA_VFLIP = True
+
+# ---- Image quality for YOLO (verified with camera_test.py, 2026-10-14) ----
+# Sensor mode. Without this Picamera2 picks the smallest 1536x864 (3x3 binned)
+# mode for a 640x480 output; the 2304x1296 (2x2 binned) mode scaled down by
+# the ISP keeps more detail. YOLO runs at ~3-4 fps, so the lower sensor fps
+# (56 instead of 120) does not matter.
+CAMERA_SENSOR_SIZE = (2304, 1296)
+# Camera Module 3 (standard lens) has a shallower depth of field than the
+# wide version, so keep continuous autofocus on. Fast speed because the cane
+# moves; Normal range avoids hunting into macro distances.
+CAMERA_AUTOFOCUS = True
+# Centre-weighted metering: expose for the object in the middle of the frame
+# rather than a bright window/sky behind it.
+CAMERA_METERING_CENTRE = True
+# Pi 5 ISP HDR (backlight compensation). Works on this Pi; off by default.
+CAMERA_HDR = False
+# queue=False -> capture_array() always returns the newest frame, so a slow
+# YOLO loop does not act on a stale one.
+CAMERA_QUEUE = False
+
 YOLO_MODEL_PATH = "yolov8n.pt"
 CONFIDENCE_THRESHOLD = 0.35
+YOLO_CLASSES_PER_BLE_CHUNK = 6
 
 
 # =========================================================
@@ -85,6 +117,22 @@ MOTOR_RIGHT = 3
 
 MOTOR_STRENGTH_PERCENT = 30
 MOTOR_UPDATE_INTERVAL = 0.25
+
+# Navigation vibrations are short cues, not continuous motor output.
+# TOP/front=straight, LEFT=left turn, RIGHT=right turn, BOTTOM/back=U-turn.
+NAVIGATION_MOTOR_DURATION_SEC = {
+    "FORWARD": 0.25,
+    "LEFT": 0.60,
+    "RIGHT": 0.60,
+    "UTURN": 0.85,
+}
+
+NAVIGATION_TO_MOTOR_DIRECTION = {
+    "FORWARD": "TOP",
+    "LEFT": "LEFT",
+    "RIGHT": "RIGHT",
+    "UTURN": "BOTTOM",
+}
 
 DIRECTION_TO_CHANNELS = {
     "TOP": [MOTOR_TOP],
@@ -110,29 +158,25 @@ DIRECTION_TO_CHANNELS = {
 
 
 # =========================================================
-# ToF settings - 8 x VL53L1X
+# ToF settings - 6 x VL53L1X
 # =========================================================
 
 TOF_ADDRESSES = [
     0x2A,
     0x2B,
     0x2C,
-    0x2D,
     0x2E,
     0x2F,
     0x30,
-    0x31,
 ]
 
 TOF_XSHUT_PINS = [
     board.D17,
     board.D27,
     board.D22,
-    board.D23,
     board.D24,
     board.D25,
     board.D5,
-    board.D26,
 ]
 
 TOF_DISTANCE_MODE = 2
@@ -142,6 +186,65 @@ TOF_READ_INTERVAL_SEC = 0.10
 TOF_PRINT_INTERVAL_SEC = 0.50
 TOF_BLE_INTERVAL_SEC = 0.50
 
+# Physical order must match TOF_XSHUT_PINS and TOF_ADDRESSES above.
+# Logical hazard grouping:
+# ToF1      = LEFT
+# ToF2~3    = FRONT
+# ToF4      = RIGHT
+# ToF5~6    = UPPER
+#
+# ToF1 = LEFT  (GPIO17, 0x2A)
+# ToF2 = FRONT (GPIO27, 0x2B)
+# ToF3 = FRONT (GPIO22, 0x2C)
+# ToF4 = RIGHT (GPIO24, 0x2E)
+# ToF5 = UPPER (GPIO25, 0x2F)
+# ToF6 = UPPER (GPIO5,  0x30)
+TOF_SENSOR_LAYOUT = [
+    # ToF1: 왼쪽
+    {"position": "LEFT", "label": "왼쪽", "threshold_cm": 75.0},
+
+    # ToF2~3: 정면
+    {"position": "FRONT", "label": "정면", "threshold_cm": 150.0},
+    {"position": "FRONT", "label": "정면", "threshold_cm": 150.0},
+
+    # ToF4: 오른쪽
+    {"position": "RIGHT", "label": "오른쪽", "threshold_cm": 75.0},
+
+    # ToF5~6: 위쪽
+    {"position": "UPPER", "label": "위쪽", "threshold_cm": 200.0},
+    {"position": "UPPER", "label": "위쪽", "threshold_cm": 200.0},
+]
+
+# 내부 로직은 LEFT/FRONT/RIGHT/UPPER를 그대로 사용하고,
+# 앱으로 전송하거나 로그에 표시할 때만 한글로 변환한다.
+TOF_POSITION_KO = {
+    "LEFT": "왼쪽",
+    "FRONT": "정면",
+    "RIGHT": "오른쪽",
+    "UPPER": "위쪽",
+}
+
+TOF_HAZARD_BLE_REPEAT_SEC = 5.0
+TOF_HAZARD_CLEAR_READS = 3
+
+# Hazard vibration pattern
+# Each sensor's danger range is divided into 3 proportional zones:
+# nearest 1/3  -> 3 short pulses
+# middle 1/3   -> 2 short pulses
+# farthest 1/3 -> 1 short pulse
+#
+# Current ranges:
+# LEFT/RIGHT 75cm: 0~25cm 3 pulses, 26~50cm 2 pulses, 51~75cm 1 pulse
+# FRONT 150cm: 0~50cm 3 pulses, 51~100cm 2 pulses, 101~150cm 1 pulse
+# UPPER 200cm: 0~66cm 3 pulses, 67~133cm 2 pulses, 134~200cm 1 pulse
+TOF_HAZARD_PULSE_ON_SEC = 0.22
+TOF_HAZARD_PULSE_GAP_SEC = 0.18
+TOF_HAZARD_CYCLE_GAP_SEC = {
+    1: 2.50,
+    2: 1.80,
+    3: 1.20,
+}
+
 # Recovery settings
 TOF_MAX_CONSECUTIVE_ERRORS = 5
 TOF_RECOVERY_COOLDOWN_SEC = 2.0
@@ -150,11 +253,26 @@ TOF_RECOVERY_SETTLE_SEC = 1.0
 tof_i2c = None
 tof_xshut = []
 tof_sensors = []
-tof_last_values = [None] * 8
-tof_error_counts = [0] * 8
+tof_last_values = [None] * len(TOF_ADDRESSES)
+tof_error_counts = [0] * len(TOF_ADDRESSES)
 tof_recovery_requested = False
 tof_recovering = False
 tof_last_recovery_time = 0.0
+tof_hazard_active = False
+tof_hazard_detections = []
+tof_hazard_clear_count = 0
+tof_last_hazard_signature = None
+tof_last_hazard_ble_time = 0.0
+tof_hazard_pulse_count = 0
+tof_hazard_pulses_done = 0
+tof_hazard_motor_on = False
+tof_hazard_next_transition_time = 0.0
+
+# 앱(설정 탭)에서 BLE로 바꾸는 위험 감지 옵션
+# HAZARD:ON / HAZARD:OFF      -> hazard_enabled
+# HAZARD:DIST:<cm> / DEFAULT  -> hazard_max_distance_cm (None이면 센서별 기본 threshold)
+hazard_enabled = True
+hazard_max_distance_cm = None
 
 
 # =========================================================
@@ -175,6 +293,7 @@ pld_button = None
 
 target_class = None
 searching = False
+yolo_class_names = []
 
 smartcane_characteristic = None
 
@@ -183,6 +302,9 @@ motor_i2c = None
 shared_i2c = None
 last_motor_direction = None
 last_motor_update_time = 0.0
+navigation_motor_direction = None
+navigation_motor_until = 0.0
+object_motor_active = False
 
 
 # =========================================================
@@ -216,11 +338,16 @@ def set_target(new_target):
 def stop_search():
     global target_class
     global searching
+    global object_motor_active
 
     target_class = None
     searching = False
+    object_motor_active = False
 
-    motor_stop_all()
+    if tof_hazard_active:
+        motor_set_direction("CENTER")
+    else:
+        motor_stop_all()
 
     print("")
     print("================================")
@@ -337,6 +464,99 @@ def motor_set_direction(direction):
     )
 
 
+def start_navigation_motor_cue(action):
+    global navigation_motor_direction
+    global navigation_motor_until
+
+    action = action.strip().upper()
+
+    if action == "STOP":
+        navigation_motor_direction = None
+        navigation_motor_until = 0.0
+        if tof_hazard_active:
+            motor_set_direction("CENTER")
+        else:
+            motor_stop_all()
+        print("[NAV MOTOR] STOP")
+        return True
+
+    motor_direction = NAVIGATION_TO_MOTOR_DIRECTION.get(
+        action
+    )
+    duration = NAVIGATION_MOTOR_DURATION_SEC.get(
+        action
+    )
+
+    if motor_direction is None or duration is None:
+        return False
+
+    if pca is None:
+        print(
+            "[NAV MOTOR] PCA9685 is not initialized"
+        )
+        return False
+
+    navigation_motor_direction = motor_direction
+    navigation_motor_until = time.time() + duration
+    # 媛앹껜 ?먯깋 吏꾨룞???대? 異쒕젰 以묒씠硫?洹?異쒕젰???딆? ?딄퀬, ?먯???媛앹껜媛
+    # ?щ씪吏??利됱떆 ?⑥? ?대퉬寃뚯씠???덈궡 ?쒓컙 ?숈븞 吏꾨룞???댁뼱??異쒕젰?쒕떎.
+    if not object_motor_active and not tof_hazard_active:
+        motor_set_direction(motor_direction)
+
+    print(
+        "[NAV MOTOR]",
+        action,
+        "->",
+        motor_direction,
+        f"({duration:.2f}s)"
+    )
+    return True
+
+
+def update_navigation_motor_cue(now):
+    global navigation_motor_direction
+    global navigation_motor_until
+
+    if navigation_motor_direction is None:
+        return False
+
+    if now >= navigation_motor_until:
+        navigation_motor_direction = None
+        navigation_motor_until = 0.0
+        if not object_motor_active and not tof_hazard_active:
+            motor_stop_all()
+        return False
+
+    if (
+        not object_motor_active
+        and not tof_hazard_active
+        and last_motor_direction != navigation_motor_direction
+    ):
+        motor_set_direction(
+            navigation_motor_direction
+        )
+
+    return True
+
+
+def apply_navigation_motor_if_active(now):
+    """媛앹껜 吏꾨룞???놁쓣 ???⑥븘 ?덈뒗 ?대퉬寃뚯씠??吏꾨룞??異쒕젰?쒕떎."""
+    # ?꾪뿕 媛먯? 以묒뿉??ToF ?꾪뿕 ?⑦꽩 ?쒖뼱 ?⑥닔媛 紐⑦꽣瑜??⑤룆 ?쒖뼱?쒕떎.
+    # ?ш린??CENTER瑜??ㅼ떆 耳쒕㈃ ?꾪뿕 ?⑦꽩??OFF/?댁떇 援ш컙??臾댁떆?섏뼱
+    # 紐⑦꽣媛 怨꾩냽 吏꾨룞?섎뒗 寃껋쿂???숈옉?섎?濡??꾨Т寃껊룄 嫄대뱶由ъ? ?딅뒗??
+    if tof_hazard_active:
+        return True
+
+    active = update_navigation_motor_cue(now)
+
+    if active and navigation_motor_direction is not None:
+        motor_set_direction(navigation_motor_direction)
+        return True
+
+    motor_stop_all()
+    return False
+
+
 def cleanup_motor():
     global pca
     global motor_i2c
@@ -399,13 +619,13 @@ def initialize_tof():
 
     print("")
     print("================================")
-    print(" 8 ToF initialization")
+    print(" 6 ToF initialization")
     print("================================")
 
     tof_i2c = initialize_shared_i2c()
     tof_xshut = []
 
-    # Shut down all 8 sensors first.
+    # Shut down all 6 sensors first.
     for pin_name in TOF_XSHUT_PINS:
         pin = digitalio.DigitalInOut(
             pin_name
@@ -467,7 +687,7 @@ def initialize_tof():
         time.sleep(0.05)
 
     print("")
-    print("[ToF] All 8 sensors ready")
+    print("[ToF] All 6 sensors ready")
     print(
         "[ToF] Addresses:",
         " ".join(
@@ -497,10 +717,7 @@ def read_tof_once():
                 tof_last_values[i] = (
                     None
                     if distance is None
-                    else round(
-                        float(distance),
-                        1
-                    )
+                    else int(float(distance))
                 )
 
                 # Successful I2C communication resets this sensor's counter.
@@ -576,7 +793,7 @@ def recover_tof_if_needed():
     )
     print(
         "[ToF] Stopping motors and rebuilding "
-        "all 8 ToF addresses..."
+        "all 6 ToF addresses..."
     )
 
     motor_stop_all()
@@ -654,7 +871,7 @@ def print_tof_values():
             )
         else:
             values.append(
-                f"ToF{i + 1}: {distance:.1f} cm"
+                f"ToF{i + 1}: {int(distance)} cm"
             )
 
     print(
@@ -677,6 +894,395 @@ def send_tof_values():
             "values": tof_last_values,
         }
     )
+
+
+def get_tof_hazard_detections():
+    """Return every sensor currently at or inside its danger threshold."""
+    detections = []
+
+    for index, (sensor_info, distance) in enumerate(
+        zip(TOF_SENSOR_LAYOUT, tof_last_values)
+    ):
+        if distance is None or distance <= 0:
+            continue
+
+        threshold = float(sensor_info["threshold_cm"])
+        # 앱에서 거리 상한을 보냈으면 센서 기본값보다 가까운 쪽을 쓴다.
+        if hazard_max_distance_cm is not None:
+            threshold = min(threshold, float(hazard_max_distance_cm))
+        if distance <= threshold:
+            detections.append(
+                {
+                    "sensor": index + 1,
+                    "position": sensor_info["position"],
+                    "distance_cm": int(float(distance)),
+                    "threshold_cm": threshold,
+                }
+            )
+
+    return detections
+
+
+def group_tof_hazard_detections(detections):
+    """
+    Merge multiple sensors that represent the same logical direction.
+
+    FRONT: ToF2~3
+    UPPER: ToF5~6
+
+    If one or more sensors in the same direction detect a hazard,
+    that direction is returned only once. The nearest distance in
+    that direction is used.
+    """
+    grouped = {}
+
+    for item in detections:
+        position = item["position"]
+
+        if (
+            position not in grouped
+            or item["distance_cm"] < grouped[position]["distance_cm"]
+        ):
+            grouped[position] = item
+
+    direction_order = [
+        "LEFT",
+        "FRONT",
+        "RIGHT",
+        "UPPER",
+    ]
+
+    return [
+        grouped[position]
+        for position in direction_order
+        if position in grouped
+    ]
+
+
+def send_tof_hazard(state, detections):
+    if (
+        smartcane_characteristic is None
+        or not smartcane_characteristic.notifying
+    ):
+        return
+
+    grouped_detections = group_tof_hazard_detections(
+        detections
+    )
+
+    smartcane_characteristic.send_json(
+        {
+            "type": "hazard",
+            "state": state,
+            # Each logical direction appears only once.
+            # If several sensors in one direction detect an obstacle,
+            # the nearest distance for that direction is sent.
+            "positions": [
+                TOF_POSITION_KO.get(
+                    item["position"],
+                    item["position"]
+                )
+                for item in grouped_detections
+            ],
+            "distances_cm": [
+                item["distance_cm"]
+                for item in grouped_detections
+            ],
+        }
+    )
+
+
+def get_tof_hazard_pulse_count(detections):
+    """Convert obstacle distance into 1/2/3 pulses using each sensor's threshold proportion."""
+    if not detections:
+        return 0
+
+    # Different sensor groups have different danger thresholds.
+    # Compare distance as a ratio of each sensor's own threshold so that
+    # the vibration severity scales proportionally with the configured range.
+    #
+    # ratio <= 1/3 : 3 pulses
+    # ratio <= 2/3 : 2 pulses
+    # ratio <= 1.0 : 1 pulse
+    most_dangerous_ratio = min(
+        float(item["distance_cm"]) / float(item["threshold_cm"])
+        for item in detections
+        if float(item["threshold_cm"]) > 0.0
+    )
+
+    if most_dangerous_ratio <= (1.0 / 3.0):
+        return 3
+
+    if most_dangerous_ratio <= (2.0 / 3.0):
+        return 2
+
+    return 1
+
+
+def reset_tof_hazard_pattern():
+    global tof_hazard_pulse_count
+    global tof_hazard_pulses_done
+    global tof_hazard_motor_on
+    global tof_hazard_next_transition_time
+
+    tof_hazard_pulse_count = 0
+    tof_hazard_pulses_done = 0
+    tof_hazard_motor_on = False
+    tof_hazard_next_transition_time = 0.0
+
+
+def start_tof_hazard_pattern(now, pulse_count):
+    global tof_hazard_pulse_count
+    global tof_hazard_pulses_done
+    global tof_hazard_motor_on
+    global tof_hazard_next_transition_time
+
+    tof_hazard_pulse_count = pulse_count
+    tof_hazard_pulses_done = 0
+    tof_hazard_motor_on = True
+    tof_hazard_next_transition_time = (
+        now + TOF_HAZARD_PULSE_ON_SEC
+    )
+
+    motor_set_direction("CENTER")
+
+
+def update_tof_hazard_motor_pattern(now, pulse_count):
+    """Run 1/2/3-pulse all-motor warning pattern without blocking the main loop."""
+    global tof_hazard_pulse_count
+    global tof_hazard_pulses_done
+    global tof_hazard_motor_on
+    global tof_hazard_next_transition_time
+
+    if pulse_count <= 0:
+        reset_tof_hazard_pattern()
+        return
+
+    if (
+        tof_hazard_pulse_count != pulse_count
+        or tof_hazard_next_transition_time <= 0.0
+    ):
+        start_tof_hazard_pattern(
+            now,
+            pulse_count
+        )
+        return
+
+    if now < tof_hazard_next_transition_time:
+        return
+
+    if tof_hazard_motor_on:
+        motor_stop_all()
+        tof_hazard_motor_on = False
+        tof_hazard_pulses_done += 1
+
+        if tof_hazard_pulses_done >= tof_hazard_pulse_count:
+            tof_hazard_pulses_done = 0
+            tof_hazard_next_transition_time = (
+                now
+                + TOF_HAZARD_CYCLE_GAP_SEC[
+                    tof_hazard_pulse_count
+                ]
+            )
+        else:
+            tof_hazard_next_transition_time = (
+                now + TOF_HAZARD_PULSE_GAP_SEC
+            )
+
+        return
+
+    motor_set_direction("CENTER")
+    tof_hazard_motor_on = True
+    tof_hazard_next_transition_time = (
+        now + TOF_HAZARD_PULSE_ON_SEC
+    )
+
+
+def clear_tof_hazard(reason):
+    """Drop the active hazard state, stop the warning pattern, and notify the app."""
+    global tof_hazard_active
+    global tof_hazard_detections
+    global tof_hazard_clear_count
+    global tof_last_hazard_signature
+
+    tof_hazard_active = False
+    tof_hazard_detections = []
+    tof_hazard_clear_count = 0
+    tof_last_hazard_signature = None
+
+    reset_tof_hazard_pattern()
+    motor_stop_all()
+
+    send_tof_hazard(
+        "cleared",
+        []
+    )
+
+    print(
+        "[HAZARD] Cleared ->",
+        reason
+    )
+
+
+def send_hazard_setting():
+    """Report the current hazard options to the app."""
+    if smartcane_characteristic is None:
+        return
+
+    smartcane_characteristic.send_json(
+        {
+            "type": "hazard_setting",
+            "enabled": hazard_enabled,
+            "max_distance_cm": hazard_max_distance_cm,
+        }
+    )
+
+
+def handle_hazard_command(argument):
+    """HAZARD:ON | HAZARD:OFF | HAZARD:DIST:<cm> | HAZARD:DIST:DEFAULT | HAZARD:GET"""
+    global hazard_enabled
+    global hazard_max_distance_cm
+
+    argument = argument.strip().upper()
+
+    if argument == "ON":
+        hazard_enabled = True
+
+    elif argument == "OFF":
+        hazard_enabled = False
+        if tof_hazard_active:
+            clear_tof_hazard("disabled by app")
+
+    elif argument.startswith("DIST:"):
+        value = argument.split(":", 1)[1].strip()
+
+        if value in ("", "DEFAULT", "MAX", "0"):
+            hazard_max_distance_cm = None
+        else:
+            try:
+                parsed = int(float(value))
+            except ValueError:
+                print("Invalid HAZARD distance:", value)
+                send_hazard_setting()
+                return
+
+            # 10cm 미만은 센서 오차 범위라 의미가 없고, 400cm는 VL53L1X 최대치다.
+            hazard_max_distance_cm = max(10, min(400, parsed))
+
+    elif argument == "GET":
+        pass
+
+    else:
+        print("Invalid HAZARD command:", argument)
+        send_hazard_setting()
+        return
+
+    print(
+        "[HAZARD] Setting:",
+        "enabled=" + str(hazard_enabled),
+        "max_distance_cm=" + str(hazard_max_distance_cm),
+    )
+    send_hazard_setting()
+
+
+def update_tof_hazard(now):
+    """Update hazard state, patterned all-motor warning, and BLE hazard messages."""
+    global tof_hazard_active
+    global tof_hazard_detections
+    global tof_hazard_clear_count
+    global tof_last_hazard_signature
+    global tof_last_hazard_ble_time
+
+    # 앱에서 위험 감지를 끈 경우: 판정, 진동, BLE 위험 전송을 모두 하지 않는다.
+    # ToF 거리값 자체는 계속 읽고 전송하므로 앱 화면의 센서값은 그대로 보인다.
+    if not hazard_enabled:
+        if tof_hazard_active:
+            clear_tof_hazard("disabled by app")
+        return False
+
+    detections = get_tof_hazard_detections()
+
+    if detections:
+        grouped_detections = group_tof_hazard_detections(
+            detections
+        )
+
+        signature = tuple(
+            detection["position"]
+            for detection in grouped_detections
+        )
+        changed = signature != tof_last_hazard_signature
+        newly_active = not tof_hazard_active
+
+        tof_hazard_active = True
+        tof_hazard_detections = detections
+        tof_hazard_clear_count = 0
+
+        pulse_count = get_tof_hazard_pulse_count(
+            detections
+        )
+        update_tof_hazard_motor_pattern(
+            now,
+            pulse_count
+        )
+
+        should_notify = (
+            newly_active
+            or changed
+            or now - tof_last_hazard_ble_time
+            >= TOF_HAZARD_BLE_REPEAT_SEC
+        )
+
+        if should_notify:
+            send_tof_hazard(
+                "detected",
+                detections
+            )
+            tof_last_hazard_ble_time = now
+            tof_last_hazard_signature = signature
+
+        if newly_active or changed:
+            grouped_detections = group_tof_hazard_detections(
+                detections
+            )
+
+            labels = [
+                TOF_SENSOR_LAYOUT[
+                    detection["sensor"] - 1
+                ]["label"]
+                for detection in grouped_detections
+            ]
+            nearest = min(
+                detection["distance_cm"]
+                for detection in detections
+            )
+
+            print(
+                "[HAZARD] Detected:",
+                ", ".join(labels),
+                f"| nearest={int(nearest)}cm",
+                f"| pattern={pulse_count} pulse(s)",
+            )
+
+        return True
+
+    if tof_hazard_active:
+        tof_hazard_clear_count += 1
+
+        if (
+            tof_hazard_clear_count
+            < TOF_HAZARD_CLEAR_READS
+        ):
+            # Keep the last pattern alive briefly while confirming the obstacle is gone.
+            update_tof_hazard_motor_pattern(
+                now,
+                tof_hazard_pulse_count
+            )
+            return True
+
+        clear_tof_hazard("returning motor control")
+
+    return False
 
 
 # =========================================================
@@ -1009,6 +1615,54 @@ def get_status_data():
 # BLE command handler
 # =========================================================
 
+def send_yolo_class_chunks():
+    """Send the classes of the loaded YOLO model in BLE-safe chunks."""
+    if smartcane_characteristic is None:
+        return
+
+    if not yolo_class_names:
+        smartcane_characteristic.send_json(
+            {
+                "type": "object_classes",
+                "state": "not_ready",
+                "message": "YOLO model is not ready"
+            }
+        )
+        return
+
+    total = (
+        len(yolo_class_names)
+        + YOLO_CLASSES_PER_BLE_CHUNK
+        - 1
+    ) // YOLO_CLASSES_PER_BLE_CHUNK
+    batch_id = time.time_ns()
+
+    for index in range(total):
+        start = index * YOLO_CLASSES_PER_BLE_CHUNK
+        end = start + YOLO_CLASSES_PER_BLE_CHUNK
+
+        smartcane_characteristic.send_json(
+            {
+                "type": "object_classes",
+                "state": "chunk",
+                "batch": str(batch_id),
+                "index": index,
+                "total": total,
+                "classes": yolo_class_names[start:end]
+            }
+        )
+
+        # Avoid overwriting notifications too quickly on some BLE adapters.
+        time.sleep(0.02)
+
+    print(
+        "[YOLO] Sent",
+        len(yolo_class_names),
+        "classes in",
+        total,
+        "BLE chunks"
+    )
+
 def handle_command(text):
     text = text.strip()
 
@@ -1040,8 +1694,66 @@ def handle_command(text):
                 )
         return
 
+    if text.upper() == "GET_CLASSES":
+        send_yolo_class_chunks()
+        return
+
+    if text.upper().startswith("HAZARD:"):
+        handle_hazard_command(
+            text.split(
+                ":",
+                1
+            )[1]
+        )
+        return
+
+    if text.upper().startswith("NAV:"):
+        action = text.split(
+            ":",
+            1
+        )[1].strip().upper()
+
+        accepted = start_navigation_motor_cue(
+            action
+        )
+
+        motor_direction = NAVIGATION_TO_MOTOR_DIRECTION.get(
+            action
+        )
+        channels = DIRECTION_TO_CHANNELS.get(
+            motor_direction,
+            []
+        )
+        if accepted:
+            motor_state = "activated"
+        elif motor_direction is not None and pca is None:
+            motor_state = "motor_unavailable"
+        else:
+            motor_state = "invalid"
+
+        if smartcane_characteristic is not None:
+            smartcane_characteristic.send_json(
+                {
+                    "type": "navigation_motor",
+                    "action": action,
+                    "direction": motor_direction,
+                    "channels": channels,
+                    "state": motor_state
+                }
+            )
+
+        if not accepted:
+            print(
+                "Invalid NAV command:",
+                action
+            )
+        return
+
     if text.upper() == "STOP":
         stop_search()
+        start_navigation_motor_cue(
+            "STOP"
+        )
 
         if smartcane_characteristic is not None:
             smartcane_characteristic.send_json(
@@ -1053,24 +1765,46 @@ def handle_command(text):
         return
 
     if text.startswith("FIND:"):
-        target = text.split(
+        requested_target = text.split(
             ":",
             1
-        )[1].strip()
+        )[1].strip().lower()
 
-        if target:
-            set_target(target)
+        matched_target = next(
+            (
+                class_name
+                for class_name in yolo_class_names
+                if class_name.lower() == requested_target
+            ),
+            None
+        )
+
+        if matched_target is not None:
+            set_target(matched_target)
 
             if smartcane_characteristic is not None:
                 smartcane_characteristic.send_json(
                     {
                         "type": "search",
                         "state": "started",
-                        "target": target
+                        "target": matched_target
                     }
                 )
         else:
-            print("Invalid FIND command")
+            print(
+                "Unsupported YOLO target:",
+                requested_target
+            )
+
+            if smartcane_characteristic is not None:
+                smartcane_characteristic.send_json(
+                    {
+                        "type": "search",
+                        "state": "rejected",
+                        "target": requested_target,
+                        "reason": "unsupported_class"
+                    }
+                )
 
         return
 
@@ -1488,6 +2222,87 @@ class SmartCaneCharacteristic(
 
 
 # =========================================================
+# Camera setup
+# =========================================================
+
+def create_camera():
+    picam2 = Picamera2()
+
+    config_kwargs = {
+        "main": {
+            "size": CAMERA_SIZE,
+            "format": CAMERA_FORMAT
+        },
+        "transform": Transform(
+            hflip=CAMERA_HFLIP,
+            vflip=CAMERA_VFLIP
+        ),
+        "queue": CAMERA_QUEUE,
+    }
+
+    if CAMERA_SENSOR_SIZE:
+        config_kwargs["sensor"] = {
+            "output_size": CAMERA_SENSOR_SIZE
+        }
+
+    camera_config = (
+        picam2.create_preview_configuration(
+            **config_kwargs
+        )
+    )
+
+    picam2.configure(
+        camera_config
+    )
+
+    cam_controls = {}
+
+    if CAMERA_AUTOFOCUS:
+        cam_controls["AfMode"] = controls.AfModeEnum.Continuous
+        cam_controls["AfSpeed"] = controls.AfSpeedEnum.Fast
+        cam_controls["AfRange"] = controls.AfRangeEnum.Normal
+
+    if CAMERA_METERING_CENTRE:
+        cam_controls["AeMeteringMode"] = (
+            controls.AeMeteringModeEnum.CentreWeighted
+        )
+
+    if CAMERA_HDR:
+        cam_controls["HdrMode"] = controls.HdrModeEnum.SingleExposure
+
+    # Skip controls this camera module does not support
+    # (e.g. no autofocus on a V2 module) instead of failing at start-up.
+    available = set(picam2.camera_controls.keys())
+
+    for name in list(cam_controls.keys()):
+        if name not in available:
+            print(
+                "Camera control not supported, skipped:",
+                name
+            )
+            del cam_controls[name]
+
+    if cam_controls:
+        picam2.set_controls(
+            cam_controls
+        )
+
+    picam2.start()
+
+    time.sleep(1)
+
+    sensor_cfg = picam2.camera_configuration().get("sensor", {})
+    print(
+        "Camera sensor mode:",
+        sensor_cfg.get("output_size"),
+        "| AF:", "ON" if "AfMode" in cam_controls else "OFF",
+        "| HDR:", "ON" if "HdrMode" in cam_controls else "OFF"
+    )
+
+    return picam2
+
+
+# =========================================================
 # Camera preprocessing
 # =========================================================
 
@@ -1775,6 +2590,17 @@ def setup_bluetooth_controller():
             + command
         )
 
+        # btmgmt needs a terminal and hangs forever without one. When started
+        # by systemd (no TTY) wrap it in a pseudo-terminal via util-linux
+        # `script`; `-e` returns the child's exit code, `-q` keeps it quiet.
+        if not sys.stdin.isatty():
+            full_command = [
+                "script",
+                "-qec",
+                " ".join(full_command),
+                "/dev/null"
+            ]
+
         result = subprocess.run(
             full_command,
             capture_output=True,
@@ -1932,11 +2758,13 @@ def initialize_ble():
 
 def main():
     global last_motor_update_time
+    global object_motor_active
+    global yolo_class_names
 
     print("")
     print("================================")
     print(" SmartCane Full Integration Test")
-    print(" BLE + X120x + 8 ToF + Camera + YOLO + Motor")
+    print(" BLE + X120x + 6 ToF + Camera + YOLO + Motor")
     print("================================")
     print("")
     print("Camera :", "ON" if USE_CAMERA else "OFF")
@@ -1969,32 +2797,27 @@ def main():
             YOLO_MODEL_PATH
         )
 
-        print("YOLO model loaded")
+        if isinstance(model.names, dict):
+            yolo_class_names = [
+                str(model.names[class_id])
+                for class_id in sorted(model.names)
+            ]
+        else:
+            yolo_class_names = [
+                str(class_name)
+                for class_name in model.names
+            ]
+
+        print(
+            "YOLO model loaded:",
+            len(yolo_class_names),
+            "classes"
+        )
 
     if USE_CAMERA:
         print("Starting camera...")
 
-        picam2 = Picamera2()
-
-        camera_config = (
-            picam2.create_preview_configuration(
-                main={
-                    "size": (
-                        640,
-                        480
-                    ),
-                    "format": "RGB888"
-                }
-            )
-        )
-
-        picam2.configure(
-            camera_config
-        )
-
-        picam2.start()
-
-        time.sleep(1)
+        picam2 = create_camera()
 
         print("Camera ready")
 
@@ -2004,6 +2827,9 @@ def main():
     last_tof_print_time = 0.0
     last_tof_ble_time = 0.0
     last_found_direction = None
+    # Set when a ToF hazard ends so the next detected object direction is
+    # re-sent to the app even if it did not change during the hazard.
+    hazard_was_active = False
 
     try:
         while True:
@@ -2013,6 +2839,14 @@ def main():
                 )
 
             now = time.time()
+
+            update_navigation_motor_cue(now)
+
+            # Hazard just ended: forget the last sent object direction so the
+            # app gets the current direction again (voice re-announce).
+            if hazard_was_active and not tof_hazard_active:
+                last_found_direction = None
+            hazard_was_active = tof_hazard_active
 
             # ---------------------------------
             # Send Raspberry Pi / X120x status
@@ -2037,7 +2871,7 @@ def main():
                 last_status_time = now
 
             # ---------------------------------
-            # 8 x ToF read / recovery / output
+            # 6 x ToF read / recovery / output
             # ---------------------------------
 
             if (
@@ -2046,6 +2880,7 @@ def main():
                 >= TOF_READ_INTERVAL_SEC
             ):
                 read_tof_once()
+                update_tof_hazard(now)
                 last_tof_read_time = now
 
             if USE_TOF:
@@ -2056,6 +2891,7 @@ def main():
                     last_tof_read_time = now
                     last_tof_print_time = now
                     last_tof_ble_time = now
+                    update_tof_hazard(now)
 
             if (
                 USE_TOF
@@ -2078,6 +2914,8 @@ def main():
             # ---------------------------------
 
             if not USE_CAMERA:
+                object_motor_active = False
+                apply_navigation_motor_if_active(now)
                 time.sleep(0.05)
                 continue
 
@@ -2099,7 +2937,8 @@ def main():
                 not searching
                 or target_class is None
             ):
-                motor_stop_all()
+                object_motor_active = False
+                apply_navigation_motor_if_active(now)
 
                 cv2.putText(
                     boxed,
@@ -2172,6 +3011,7 @@ def main():
                             }
 
                 if best_detection is not None:
+                    object_motor_active = True
                     bbox = (
                         best_detection[
                             "bbox"
@@ -2206,9 +3046,10 @@ def main():
                         direction
                     )
 
-                    motor_set_direction(
-                        direction
-                    )
+                    if not tof_hazard_active:
+                        motor_set_direction(
+                            direction
+                        )
 
                     if (
                         direction
@@ -2251,7 +3092,8 @@ def main():
                         last_print_time = now
 
                 else:
-                    motor_stop_all()
+                    object_motor_active = False
+                    apply_navigation_motor_if_active(now)
                     last_found_direction = None
 
                     cv2.putText(

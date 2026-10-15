@@ -24,7 +24,7 @@ Raspberry Pi 5에서 카메라 객체 인식, ToF 거리 측정, 방향별 진�
 ```text
 smart_cane/
 ├── main/
-│   └── smartcane_full_integration.py  # 전체 시스템 통합
+│   └── smartcane.py  # 전체 시스템 통합
 ├── vision/
 │   ├── camera_test.py                # 카메라 확인
 │   ├── target_detection.py           # 목표 객체·방향 인식
@@ -123,7 +123,7 @@ Raspberry Pi에서 다음 구성 요소를 사용할 수 있어야 합니다.
 ### 5-1. 통합 프로그램
 
 ```bash
-python3 main/smartcane_full_integration.py
+python3 main/smartcane.py
 ```
 
 기본 모델 경로는 현재 작업 폴더 기준 `yolov8n.pt`입니다. 모델 파일을 `smart_cane/yolov8n.pt`에 배치하거나 통합 프로그램의 `YOLO_MODEL_PATH`를 수정합니다. 모델 가중치는 Git에 포함되지 않습니다.
@@ -134,7 +134,7 @@ python3 main/smartcane_full_integration.py
 
 ### 5-2. 통합 프로그램의 주요 설정
 
-설정 위치: [main/smartcane_full_integration.py](main/smartcane_full_integration.py)
+설정 위치: [main/smartcane.py](main/smartcane.py)
 
 | 설정 | 기본값 | 의미 |
 | --- | --- | --- |

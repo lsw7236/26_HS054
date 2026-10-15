@@ -120,7 +120,7 @@ flowchart TD
 
 ### 5-1. 객체 위치를 3×3 방향으로 변환
 
-[통합 프로그램](smart_cane/main/smartcane_full_integration.py)의 `bbox_to_direction`은 객체 바운딩 박스의 중심점을 구한 뒤, 화면의 가로·세로를 각각 3등분하여 방향을 결정합니다. 아래는 같은 함수의 서식을 간결하게 정리한 코드입니다.
+[통합 프로그램](smart_cane/main/smartcane.py)의 `bbox_to_direction`은 객체 바운딩 박스의 중심점을 구한 뒤, 화면의 가로·세로를 각각 3등분하여 방향을 결정합니다. 아래는 같은 함수의 서식을 간결하게 정리한 코드입니다.
 
 ```python
 def bbox_to_direction(bbox, width=640, height=640):
@@ -157,7 +157,7 @@ def bbox_to_direction(bbox, width=640, height=640):
 
 | 파일 | 핵심 내용 |
 | --- | --- |
-| [시스템 통합 프로그램](smart_cane/main/smartcane_full_integration.py) | BLE 명령 처리, 객체 탐색, 방향 계산, 진동 제어, ToF 복구 및 상태 전송 |
+| [시스템 통합 프로그램](smart_cane/main/smartcane.py) | BLE 명령 처리, 객체 탐색, 방향 계산, 진동 제어, ToF 복구 및 상태 전송 |
 | [객체 탐지 모듈](smart_cane/vision/target_detection.py) | 카메라 입력, Letterbox 전처리, 목표 객체 탐지 및 방향 계산 |
 | [방향별 진동 제어](smart_cane/motor/direction_motor.py) | PCA9685를 이용한 방향별 모터 출력 |
 | [ToF 복구 테스트](smart_cane/tof/tof_recovery_test.py) | 거리 센서 읽기 및 오류 복구 테스트 |
@@ -196,7 +196,7 @@ Raspberry Pi에 카메라, 센서, 모터 및 전원 모듈을 연결하고 Pyth
 
 ```bash
 cd smart_cane
-python3 main/smartcane_full_integration.py
+python3 main/smartcane.py
 ```
 
 통합 프로그램은 기본적으로 카메라 창을 표시합니다. 화면 없이 실행할 경우 코드의 `SHOW_CAMERA_WINDOW` 설정을 확인하세요.
