@@ -3,7 +3,7 @@
 ## 폴더 구성
 
 - `smart_cane/`: Raspberry Pi 지팡이 코드와 기존 프로젝트 문서
-- `flutter_app/`: Flutter 앱 개발용 폴더 (아직 초기화하지 않음)
+- `flutter_app/`: 스마트 지팡이 Flutter 앱 (실행 전 `flutter_app/secrets.example.json`을 복사해 `secrets.json`을 만들고 API 키를 입력)
 
 ## 지팡이 실행
 
