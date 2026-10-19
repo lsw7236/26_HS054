@@ -15,7 +15,7 @@
 
 - **목표 객체 탐색:** YOLOv8 Nano로 카메라 영상에서 사용자가 지정한 객체를 찾습니다.
 - **촉각 방향 안내:** 화면을 3×3 영역으로 나누고 진동 모터 4개를 조합하여 8방향과 중앙 정렬 상태를 전달합니다.
-- **다중 거리 센서:** VL53L1X ToF 센서 6개로 거리를 측정하며, 연속 통신 오류 발생 시 센서를 재초기화합니다.
+- **다중 거리 센서:** VL53L1X ToF 센서 6개(왼쪽 1·정면 2·오른쪽 1·위쪽 2)로 거리를 측정하고, 임계값 이내 장애물은 진동과 BLE 메시지로 알리며, 연속 통신 오류 발생 시 센서를 재초기화합니다.
 - **음성 중심 인터페이스:** 음성 명령 입력과 TTS 안내를 제공하며 BLE로 지팡이와 통신합니다.
 - **상태 모니터링:** 배터리 잔량, 전압, 전원 및 CPU 상태 등을 확인합니다.
 
@@ -25,12 +25,12 @@
 | --- | --- |
 | 목표 객체 탐색 | 앱에서 탐색 대상을 전달하고 YOLO로 해당 객체 탐지 |
 | 객체 방향 안내 | 객체 중심점을 기준으로 방향을 계산하여 진동 출력 |
-| 주변 거리 측정 | ToF 센서 6개의 거리 데이터 수집 및 BLE 전송 |
+| 주변 거리 측정 | ToF 센서 6개의 거리 데이터 수집, 장애물 위험 판정 및 BLE 전송 |
 | 음성 명령·안내 | 음성 인식, 명령 의도 분석 및 TTS 안내 |
 | 위치·길안내 | 앱에서 현재 위치 확인, 장소 검색, 경로 안내 및 장소 저장 |
 | 기기 상태 확인 | 배터리·전원·CPU 상태를 앱으로 전달 |
 
-> 현재 앱은 `GET_CLASSES`와 `NAV:*` 명령도 전송하지만, Raspberry Pi 통합 프로그램의 명령 처리기는 `PING`, `STATUS`, `STOP`, `FIND:<target>`을 처리합니다. 객체 목록 요청 및 길안내 진동 연동은 양쪽 통신 규격을 추가로 맞춰야 합니다.
+> 앱이 보내는 `PING`, `STATUS`, `GET_CLASSES`, `FIND:<target>`, `STOP`, `NAV:*`, `HAZARD:*` 명령은 모두 Raspberry Pi 통합 프로그램이 처리합니다. 명령별 처리 결과와 송신 메시지 형식은 [Raspberry Pi 지팡이 문서](smart_cane/README.md)의 7절 BLE 규격을 참고하세요.
 
 ### 1-5. 기대 효과 및 활용 분야
 
@@ -48,7 +48,7 @@
 | 모바일 앱 | Flutter, Dart |
 | 앱 주요 패키지 | flutter_blue_plus, speech_to_text, flutter_tts, geolocator, webview_flutter, shared_preferences |
 | 외부 서비스 | OpenAI API 기반 명령 의도 분석, Kakao 지도·장소 검색 연동 |
-| 거리 센서 | VL53L1X ToF × 8 |
+| 거리 센서 | VL53L1X ToF × 6 |
 | 진동 출력 | PCA9685, 진동 모터 × 4, MOSFET 구동 회로 |
 | 전원·배터리 | X120x Raspberry Pi 전원 모듈 |
 
@@ -80,7 +80,7 @@ flowchart TD
     Camera[Raspberry Pi Camera] --> YOLO[YOLOv8 Nano 객체 인식]
     YOLO --> Direction[목표 객체 선택 및 3×3 방향 계산]
     Direction --> Pi
-    ToF[VL53L1X ToF 센서 8개] -->|I2C 거리 측정| Pi
+    ToF[VL53L1X ToF 센서 6개] -->|I2C 거리 측정| Pi
     Power[X120x 전원 모듈] -->|배터리 및 전원 상태| Pi
     Pi --> PWM[PCA9685 및 MOSFET 구동 회로]
     PWM --> Motors[진동 모터 4개]

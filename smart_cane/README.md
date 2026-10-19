@@ -12,12 +12,13 @@ Raspberry Pi 5에서 카메라 객체 인식, ToF 거리 측정, 방향별 진�
 | 객체 선택 | 동일 클래스가 여러 개면 신뢰도가 가장 높은 객체 선택 |
 | 방향 계산 | 바운딩 박스 중심점을 화면의 3×3 영역으로 분류 |
 | 진동 출력 | 진동 모터 4개를 조합하여 8방향 및 중앙 정렬 신호 출력 |
-| 거리 측정 | VL53L1X ToF 센서 8개의 거리 측정·출력·BLE 전송 |
+| 거리 측정 | VL53L1X ToF 센서 6개의 거리 측정·출력·BLE 전송 |
+| 장애물 경고 | 센서별 임계값 이내 장애물을 방향별로 판정하고 거리 비율에 따라 1~3회 펄스 진동 출력 |
 | 센서 오류 복구 | 연속 오류 감지 후 ToF 센서 재초기화 |
 | BLE | BlueZ / D-Bus 기반 GATT 서비스 |
 | 상태 모니터링 | X120x 배터리·전원 상태와 Raspberry Pi CPU 상태 전송 |
 
-현재 통합 프로그램의 진동 출력은 목표 객체의 화면 내 방향을 기준으로 합니다. ToF 거리 데이터를 장애물 위험 등급으로 변환하거나 거리 임계값에 따라 경고 진동을 발생시키는 통합 로직은 포함되어 있지 않습니다.
+객체 탐색 중 진동 출력은 목표 객체의 화면 내 방향을 기준으로 합니다. ToF 장애물 경고는 센서별 임계값(왼쪽·오른쪽 75 cm, 정면 150 cm, 위쪽 200 cm)을 기준으로 판정하며, 임계값 대비 거리 비율이 가까울수록 펄스 횟수가 늘어나고(가까운 1/3 구간 3회, 중간 2회, 먼 1/3 구간 1회) 모든 모터를 동시에 울립니다. 경고 중에는 객체 탐색·길안내 진동보다 우선합니다.
 
 ## 2. 폴더 및 실행 파일
 
@@ -52,8 +53,8 @@ smart_cane/
 | 부품 | 수량 | 용도 |
 | --- | :---: | --- |
 | Raspberry Pi 5 | 1 | 영상 추론·센서 제어·BLE 통신 |
-| Raspberry Pi Camera | 1 | 객체 탐색용 영상 입력 |
-| VL53L1X ToF | 8 | 주변 거리 측정 |
+| Raspberry Pi Camera Module 3 (표준 렌즈) | 1 | 객체 탐색용 영상 입력 |
+| VL53L1X ToF | 6 | 주변 거리 측정 (왼쪽 1, 정면 2, 오른쪽 1, 위쪽 2) |
 | PCA9685 | 1 | 모터 PWM 제어 |
 | 진동 모터 | 4 | 상·좌·하·우 및 조합 방향 안내 |
 | MOSFET 구동 회로 | 구성에 따름 | 모터 구동 |
@@ -61,18 +62,18 @@ smart_cane/
 
 ### 3-1. ToF 주소와 XSHUT 매핑
 
-아래 GPIO 번호는 BCM 번호입니다. 센서의 실제 장착 방향은 코드에 정의되어 있지 않으므로 센서 번호와 물리적 방향의 대응은 조립 구성에 맞춰 기록해야 합니다.
+아래 GPIO 번호는 BCM 번호입니다. 센서 번호, 주소, XSHUT 핀, 장착 방향과 위험 임계값은 코드의 `TOF_ADDRESSES`, `TOF_XSHUT_PINS`, `TOF_SENSOR_LAYOUT`에 정의되어 있으며 세 목록의 순서가 서로 일치해야 합니다.
 
-| 센서 번호 | I2C 주소 | XSHUT GPIO |
-| :---: | :---: | :---: |
-| 1 | `0x2A` | GPIO17 |
-| 2 | `0x2B` | GPIO27 |
-| 3 | `0x2C` | GPIO22 |
-| 4 | `0x2D` | GPIO23 |
-| 5 | `0x2E` | GPIO24 |
-| 6 | `0x2F` | GPIO25 |
-| 7 | `0x30` | GPIO5 |
-| 8 | `0x31` | GPIO26 |
+| 센서 번호 | I2C 주소 | XSHUT GPIO | 장착 방향 | 위험 임계값 |
+| :---: | :---: | :---: | :---: | :---: |
+| 1 | `0x2A` | GPIO17 | 왼쪽 | 75 cm |
+| 2 | `0x2B` | GPIO27 | 정면 | 150 cm |
+| 3 | `0x2C` | GPIO22 | 정면 | 150 cm |
+| 4 | `0x2E` | GPIO24 | 오른쪽 | 75 cm |
+| 5 | `0x2F` | GPIO25 | 위쪽 | 200 cm |
+| 6 | `0x30` | GPIO5 | 위쪽 | 200 cm |
+
+같은 방향의 센서 2개(정면, 위쪽)는 하나의 방향으로 묶어 처리하며, 그 방향에서 가장 가까운 거리값을 사용합니다.
 
 프로그램은 XSHUT를 제어하여 센서를 순서대로 초기화하고 개별 주소를 부여합니다. 센서 초기 주소가 같으므로 다중 센서 구성에서는 이 초기화 순서가 필요합니다.
 
@@ -130,7 +131,7 @@ python3 main/smartcane.py
 
 프로그램은 BLE → 배터리 → ToF → 모터 → YOLO → 카메라 순으로 초기화합니다. 이후 메인 루프에서 BLE 이벤트, 주기 상태 전송, 거리 측정·복구 및 객체 탐색을 처리합니다.
 
-기본적으로 카메라 창을 표시하며 `q` 또는 `Ctrl+C`로 종료합니다. 종료 시 센서·모터·카메라 자원을 정리합니다. 화면 없는 환경에서는 `SHOW_CAMERA_WINDOW=False`로 설정합니다.
+카메라 창(`SHOW_CAMERA_WINDOW`)은 `DISPLAY` 환경 변수가 있는 데스크톱 환경에서만 표시되고, SSH 접속이나 서비스 실행처럼 화면이 없는 환경에서는 자동으로 꺼집니다. 창이 표시될 때는 `q`, 그 외에는 `Ctrl+C`로 종료하며 종료 시 센서·모터·카메라 자원을 정리합니다.
 
 ### 5-2. 통합 프로그램의 주요 설정
 
@@ -139,17 +140,28 @@ python3 main/smartcane.py
 | 설정 | 기본값 | 의미 |
 | --- | --- | --- |
 | `USE_CAMERA`, `USE_YOLO`, `USE_MOTOR`, `USE_X120X`, `USE_TOF` | 모두 `True` | 각 기능 사용 여부 |
-| `SHOW_CAMERA_WINDOW` | `True` | OpenCV 화면 표시 |
+| `SHOW_CAMERA_WINDOW` | `DISPLAY` 환경 변수가 있으면 `True` | OpenCV 화면 표시 |
 | `YOLO_MODEL_PATH` | `yolov8n.pt` | 통합 프로그램 모델 경로 |
 | `CONFIDENCE_THRESHOLD` | `0.35` | 객체 탐지 임계값 |
 | `WIDTH`, `HEIGHT` | `640`, `640` | Letterbox 후 영상 크기 |
+| `CAMERA_SIZE` | `(640, 480)` | Picamera2 캡처 크기 |
+| `CAMERA_SENSOR_SIZE` | `(2304, 1296)` | 센서 모드(2×2 비닝)로 축소 시 세부 묘사 유지 |
+| `CAMERA_HFLIP`, `CAMERA_VFLIP` | `True` | 카메라가 거꾸로 장착되어 영상을 180° 회전 |
+| `CAMERA_AUTOFOCUS`, `CAMERA_METERING_CENTRE`, `CAMERA_HDR` | `True`, `True`, `False` | 연속 자동초점, 중앙 중점 측광, HDR 사용 여부 |
+| `YOLO_CLASSES_PER_BLE_CHUNK` | `6` | `GET_CLASSES` 응답 한 묶음에 담는 클래스 수 |
 | `PCA9685_FREQUENCY` | `1000` | PWM 주파수, Hz |
 | `MOTOR_STRENGTH_PERCENT` | `30` | 모터 출력 비율 |
 | `MOTOR_UPDATE_INTERVAL` | `0.25` | 모터 갱신 간격, 초 |
+| `NAVIGATION_MOTOR_DURATION_SEC` | 직진 `0.25`, 좌·우 `0.60`, 유턴 `0.85` | `NAV:*` 길안내 진동 지속 시간, 초 |
 | `TOF_DISTANCE_MODE` | `2` | 센서 거리 모드 |
 | `TOF_TIMING_BUDGET_MS` | `100` | ToF 측정 시간 예산, ms |
 | `TOF_READ_INTERVAL_SEC` | `0.10` | 거리 읽기 간격, 초 |
 | `TOF_PRINT_INTERVAL_SEC`, `TOF_BLE_INTERVAL_SEC` | `0.50` | 거리 출력·전송 간격, 초 |
+| `TOF_SENSOR_LAYOUT` | 왼쪽·오른쪽 `75`, 정면 `150`, 위쪽 `200` | 센서별 장착 방향과 위험 임계값, cm |
+| `TOF_HAZARD_PULSE_ON_SEC`, `TOF_HAZARD_PULSE_GAP_SEC` | `0.22`, `0.18` | 경고 펄스 1회 길이와 펄스 사이 간격, 초 |
+| `TOF_HAZARD_CYCLE_GAP_SEC` | 1회 `2.50`, 2회 `1.80`, 3회 `1.20` | 펄스 묶음 사이 휴지 시간, 초 |
+| `TOF_HAZARD_BLE_REPEAT_SEC`, `TOF_HAZARD_CLEAR_READS` | `5.0`, `3` | 같은 경고의 BLE 재전송 간격(초)과 경고 해제 판정 기준 연속 측정 수 |
+| `hazard_enabled`, `hazard_max_distance_cm` | `True`, `None` | 앱의 `HAZARD:*` 명령으로 바뀌는 경고 사용 여부와 최대 감지 거리(`None`이면 센서별 임계값) |
 | `TOF_MAX_CONSECUTIVE_ERRORS` | `5` | 복구 요청 기준 연속 오류 수 |
 | `TOF_RECOVERY_COOLDOWN_SEC` | `2.0` | 복구 간 대기 간격, 초 |
 | `TOF_RECOVERY_SETTLE_SEC` | `1.0` | 복구 후 안정화 시간, 초 |
@@ -197,7 +209,7 @@ LEFT           CENTER     RIGHT
 BOTTOM+LEFT    BOTTOM     BOTTOM+RIGHT
 ```
 
-`FIND:cell phone`처럼 모델의 클래스명과 일치하는 문자열을 전달해야 합니다. 통합 코드의 클래스 비교는 정확한 문자열 일치 방식입니다. 목표를 찾지 못하면 진동을 중지하고 탐색 상태를 유지합니다. 객체 알림은 방향이 바뀔 때 전송하며, 미탐지 후 다시 찾은 경우에도 전송됩니다.
+`FIND:cell phone`처럼 모델의 클래스명과 일치하는 문자열을 전달해야 합니다. 통합 코드의 클래스 비교는 대소문자를 구분하지 않는 전체 문자열 일치 방식이며, 모델에 없는 클래스를 요청하면 `search/rejected`를 보내고 탐색을 시작하지 않습니다. 목표를 찾지 못하면 진동을 중지하고 탐색 상태를 유지합니다. 객체 알림은 방향이 바뀔 때 전송하며, 미탐지 후 다시 찾은 경우에도 전송됩니다.
 
 ## 7. BLE 규격
 
@@ -216,10 +228,13 @@ Flutter 앱은 장치명 `SmartCane`으로 검색합니다. Raspberry Pi가 해�
 | --- | --- |
 | `PING` | `PONG FROM PI` 응답 |
 | `STATUS` | 현재 상태 JSON 전송 |
-| `FIND:<target>` | 객체 탐색 시작, `search/started` 전송 |
-| `STOP` | 객체 탐색·모터 중지, `search/stopped` 전송 |
+| `GET_CLASSES` | 로드된 YOLO 클래스 목록을 `object_classes` 메시지로 6개씩 분할 전송, 모델 로딩 전이면 `not_ready` 전송 |
+| `FIND:<target>` | 객체 탐색 시작, `search/started` 전송. 모델에 없는 클래스면 `search/rejected` 전송 |
+| `STOP` | 객체 탐색·길안내 진동·모터 중지, `search/stopped` 전송 |
+| `NAV:FORWARD` / `NAV:LEFT` / `NAV:RIGHT` / `NAV:UTURN` / `NAV:STOP` | 위·왼쪽·오른쪽·아래 모터로 길안내 진동 신호를 짧게 출력하고 `navigation_motor` 전송 |
+| `HAZARD:ON` / `HAZARD:OFF` / `HAZARD:DIST:<cm>` / `HAZARD:DIST:DEFAULT` / `HAZARD:GET` | 장애물 경고 사용 여부와 최대 감지 거리(10~400 cm) 변경·조회 후 `hazard_setting` 전송 |
 
-Notify 구독 시작 시 `HELLO FROM PI` 텍스트를 전송합니다. 명령 처리기에서 `FIND:` 접두사는 대문자로 전달해야 합니다. 빈 목표는 탐색을 시작하지 않습니다.
+Notify 구독 시작 시 `HELLO FROM PI` 텍스트를 전송합니다. 명령 처리기에서 `FIND:` 접두사는 대문자로 전달해야 하며, 그 외 명령은 대소문자를 구분하지 않습니다. 빈 목표는 탐색을 시작하지 않습니다. 길안내 진동은 객체 탐색 진동이나 장애물 경고가 출력 중이면 모터로 나가지 않습니다.
 
 ### 7-2. 송신 데이터
 
@@ -231,16 +246,50 @@ Notify 구독 시작 시 `HELLO FROM PI` 텍스트를 전송합니다. 명령 �
 {"type":"object","target":"cell phone","confidence":0.91,"direction":"TOP+LEFT"}
 ```
 
-거리 데이터는 센서 1~8 순서이며 단위는 cm입니다. 측정값이 없으면 `null`이 들어갈 수 있습니다.
+거리 데이터는 센서 1~6 순서이며 단위는 cm입니다. 측정값이 없으면 `null`이 들어갈 수 있습니다.
 
 ```json
-{"type":"tof","unit":"cm","values":[42,50,65,80,90,100,110,null]}
+{"type":"tof","unit":"cm","values":[42,120,135,80,190,null]}
 ```
 
-탐색 상태:
+탐색 상태(`state`는 `started`, `stopped`, `rejected`):
 
 ```json
 {"type":"search","state":"started","target":"cell phone"}
+```
+
+```json
+{"type":"search","state":"rejected","target":"laptop computer","reason":"unsupported_class"}
+```
+
+장애물 경고(`state`는 `detected`, `cleared`이며 같은 방향의 센서 2개는 가장 가까운 값 하나로 묶음):
+
+```json
+{"type":"hazard","state":"detected","positions":["정면","왼쪽"],"distances_cm":[95,60]}
+```
+
+경고 설정 응답(`max_distance_cm`이 `null`이면 센서별 기본 임계값):
+
+```json
+{"type":"hazard_setting","enabled":true,"max_distance_cm":null}
+```
+
+길안내 진동 응답(`state`는 `activated`, `motor_unavailable`, `invalid`):
+
+```json
+{"type":"navigation_motor","action":"LEFT","direction":"LEFT","channels":[1],"state":"activated"}
+```
+
+YOLO 클래스 목록(`GET_CLASSES` 응답, `batch`가 같은 묶음을 `index` 순서로 재조립):
+
+```json
+{"type":"object_classes","state":"chunk","batch":"1760000000000000000","index":0,"total":14,"classes":["person","bicycle","car","motorcycle","airplane","bus"]}
+```
+
+ToF 자동 복구 결과(`state`는 `recovered`, `failed`):
+
+```json
+{"type":"tof_recovery","state":"recovered"}
 ```
 
 상태 데이터의 주요 필드:
@@ -260,11 +309,8 @@ Notify 구독 시작 시 `HELLO FROM PI` 텍스트를 전송합니다. 명령 �
 
 ### 7-3. Flutter 연동 시 확인할 차이
 
-- 앱은 `GET_CLASSES`를 요청하지만 현재 통합 프로그램은 이를 처리하거나 `object_classes`를 전송하지 않습니다.
-- 앱이 보내는 `NAV:*` 길안내 진동 명령은 현재 통합 프로그램에서 처리하지 않습니다.
-- 앱에는 `hazard`, `hazard_setting`, `navigation_motor` 메시지 처리 코드가 있지만 현재 통합 프로그램은 해당 메시지를 생성하지 않습니다.
-- 지팡이가 보내는 `tof`는 앱 수신 처리기에서 거리값을 별도 화면 상태로 반영하지 않습니다.
-- 일반 JSON의 BLE 분할·재조립 규격이 없습니다. 실제 MTU와 Notify 길이에 따라 긴 상태 메시지가 온전히 전달되는지 확인해야 합니다.
+- 앱은 `status`, `object`, `hazard`, `hazard_setting`, `navigation_motor`, `object_classes`를 화면과 음성 안내에 반영합니다. `search`, `tof`, `tof_recovery`, `error`는 앱의 BLE 로그에만 표시되며, 거리값을 별도 화면 상태로 반영하지 않습니다.
+- `object_classes`만 분할·재조립 규격이 있고 그 외 JSON은 한 번의 Notify로 전송합니다. 실제 MTU와 Notify 길이에 따라 긴 상태 메시지가 온전히 전달되는지 확인해야 합니다.
 
 ## 8. ToF 오류 복구
 
@@ -300,6 +346,6 @@ Notify 구독 시작 시 `HELLO FROM PI` 텍스트를 전송합니다. 명령 �
 | 앱에서 장치를 찾지 못함 | 실제 광고 장치명이 `SmartCane`인지, 앱 검색 권한 |
 | 연결 후 상태가 안 옴 | UUID 일치, Notify 구독, `USE_X120X`, 전송 주기 및 메시지 길이 |
 | 탐색 중 객체가 안 잡힘 | 목표 클래스 문자열, 모델 지원 클래스, 임계값, 카메라 영상 |
-| 앱 길안내 진동이 없음 | 현재 통합 코드의 `NAV:*` 미지원 |
+| 앱 길안내 진동이 없음 | `navigation_motor` 응답의 `state`(`motor_unavailable`은 PCA9685 미초기화, `invalid`는 명령 형식 오류), 객체 탐색·장애물 경고 진동이 출력 중인지 여부 |
 
 전체 사용 목적과 팀원 정보·소개영상은 [상위 README](../README.md)를 참고하세요.

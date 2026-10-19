@@ -165,15 +165,16 @@ flowchart TD
 | `FIND:<target>` | 목표 객체 탐색 요청 | 처리함 |
 | `STOP` | 객체 탐색 중지 | 처리함 |
 | `STATUS` / `PING` | 지팡이 지원 명령 | 처리함 |
-| `GET_CLASSES` | YOLO 지원 객체 목록 요청 | 처리하지 않음 |
-| `NAV:FORWARD`, `NAV:LEFT`, `NAV:RIGHT`, `NAV:UTURN`, `NAV:STOP` | 길안내 진동 요청 | 처리하지 않음 |
+| `GET_CLASSES` | 물건 찾기 전에 YOLO 지원 객체 목록 요청 | 처리함 (`object_classes`로 6개씩 분할 응답) |
+| `NAV:FORWARD`, `NAV:LEFT`, `NAV:RIGHT`, `NAV:UTURN`, `NAV:STOP` | 길안내 진동 요청 | 처리함 (`navigation_motor` 응답) |
+| `HAZARD:ON`, `HAZARD:OFF`, `HAZARD:DIST:<cm>`, `HAZARD:DIST:DEFAULT` | 설정 탭의 위험 감지 사용 여부와 안내 거리(20~200 cm) 전달 | 처리함 (`hazard_setting` 응답) |
 | `type=status` | 배터리·충전·경고 반영 | 전송함 |
 | `type=object` | 목표 객체 방향 안내 | 전송함 |
-| `type=object_classes` | 객체 목록 청크 조립 | 전송하지 않음 |
-| `type=hazard`, `hazard_setting`, `navigation_motor` | 위험 알림·설정 응답·길안내 모터 상태 처리 | 전송하지 않음 |
-| `type=tof` | 현재 수신 처리기에서 거리값을 별도 화면 상태로 반영하지 않음 | 전송함 |
+| `type=object_classes` | 객체 목록 청크 조립 후 물건 찾기 대상 확인에 사용 | 전송함 |
+| `type=hazard`, `hazard_setting`, `navigation_motor` | 위험 알림·설정 응답·길안내 모터 상태 처리 | 전송함 |
+| `type=search`, `tof`, `tof_recovery`, `error` | BLE 로그에만 표시, 거리값은 화면 상태로 반영하지 않음 | 전송함 |
 
-앱의 지원 객체 목록 및 위험 알림·길안내 진동 기능은 수신 처리 코드가 존재하더라도 현재 지팡이 프로그램과의 완전한 연동이 보장되지 않습니다. 특히 객체 목록 응답 부재가 물건 찾기 시작에 영향을 줄 수 있습니다.
+물건 찾기 명령은 지팡이에서 받은 객체 목록에 있는 클래스만 `FIND:`로 전송합니다. 연결 직후 목록이 비어 있으면 `GET_CLASSES`를 먼저 요청하고, 지팡이가 `not_ready`(YOLO 로딩 전)를 응답하거나 목록을 받지 못하면 물건 찾기를 시작하지 않습니다.
 
 지팡이 객체 알림 예시:
 
@@ -206,8 +207,8 @@ flutter test
 | --- | --- |
 | 지팡이를 찾지 못함 | 장치명이 `SmartCane`인지, 지팡이 BLE 실행 상태, 검색 권한 및 Bluetooth 상태 |
 | 연결 후 서비스 확인 실패 | 두 코드의 서비스·특성 UUID 일치 여부 |
-| 연결되지만 물건 찾기가 시작되지 않음 | `GET_CLASSES` 응답 부재와 지원 객체 목록 대기 상태 |
-| 지팡이 길안내 진동이 없음 | 현재 지팡이 통합 코드의 `NAV:*` 미지원 |
+| 연결되지만 물건 찾기가 시작되지 않음 | `GET_CLASSES` 응답이 `not_ready`인지(지팡이 YOLO 로딩 전), 객체 목록 수신 여부, 요청한 물건이 목록에 있는 클래스인지 |
+| 지팡이 길안내 진동이 없음 | `navigation_motor` 응답의 `state`(`motor_unavailable`, `invalid`), 지팡이가 객체 탐색·장애물 경고 진동을 출력 중인지 |
 | 음성 입력이 안 됨 | 마이크 권한, 음성 인식 서비스 사용 가능 여부 |
 | 명령 분석 실패 | API 키의 빌드 주입, 네트워크, 서버 오류 응답 |
 | 지도가 비거나 경로 요청 실패 | Kakao 키·서비스 사용 권한·WebView 오류·경로 API 응답 |
