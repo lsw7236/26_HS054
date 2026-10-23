@@ -140,16 +140,29 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
 
   // 위험 감지 안내 설정 (설정 탭에서 조절, 앱을 다시 켜도 유지)
   // - _hazardAlertEnabled: false면 지팡이가 보낸 위험 패킷을 화면/음성에 쓰지 않는다.
-  // - _hazardAlertDistanceCm: 이 거리(cm) 이내의 장애물만 위험으로 안내한다.
-  //   최대값이면 지팡이의 기본 판정(정면 150cm, 측면 75cm, 상단 200cm)을 그대로 쓴다.
-  // 두 값은 BLE HAZARD:ON/OFF, HAZARD:DIST:<cm> 명령으로 지팡이에도 전달되어
-  // Raspberry Pi의 위험 판정과 진동 경고 자체를 켜고 끄거나 거리를 좁힌다.
+  // - _hazardAlertDistanceCm: 방향(정면/양쪽/위쪽)별로 이 거리(cm) 이내의 장애물만 위험으로 안내한다.
+  //   기본값(= 최대값)이면 지팡이의 기본 판정(정면 150cm, 양쪽 75cm, 위쪽 200cm)을 그대로 쓴다.
+  // 값들은 BLE HAZARD:ON/OFF, HAZARD:DIST:<FRONT|SIDE|UPPER>:<cm> 명령으로 지팡이에도 전달되어
+  // Raspberry Pi의 위험 판정과 진동 경고 자체를 켜고 끄거나 방향별 거리를 좁힌다.
   static const String _prefHazardAlertEnabled = 'hazard_alert_enabled';
+  // 예전 단일 거리 설정. 방향별 값이 아직 없을 때 한 번 옮겨 쓰는 데만 읽는다.
   static const String _prefHazardAlertDistanceCm = 'hazard_alert_distance_cm';
-  static const double _hazardAlertDistanceMinCm = 20;
-  static const double _hazardAlertDistanceMaxCm = 200;
+  static const String _prefHazardAlertDistancePrefix = 'hazard_alert_distance_cm_';
+  static const double _hazardAlertDistanceMinCm = 10;
+  // 키는 지팡이 HAZARD:DIST:<키>:<cm> 명령과 같다. 값은 지팡이 기본 기준(앱에서 줄일 수 있는 최대값).
+  static const Map<String, double> _hazardDirectionDefaultCm = <String, double>{
+    'FRONT': 150,
+    'SIDE': 75,
+    'UPPER': 200,
+  };
+  static const Map<String, String> _hazardDirectionLabels = <String, String>{
+    'FRONT': '정면',
+    'SIDE': '양쪽',
+    'UPPER': '위쪽',
+  };
   bool _hazardAlertEnabled = true;
-  double _hazardAlertDistanceCm = _hazardAlertDistanceMaxCm;
+  final Map<String, double> _hazardAlertDistanceCm =
+      Map<String, double>.of(_hazardDirectionDefaultCm);
   // 지팡이가 HAZARD 명령을 받아 적용한 뒤 돌려준 상태 문구. 연결 전/해제 시 비움.
   String _piHazardSettingStatus = '';
 
@@ -1504,18 +1517,25 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
     try {
       final SharedPreferences prefs = await SharedPreferences.getInstance();
       final bool enabled = prefs.getBool(_prefHazardAlertEnabled) ?? true;
-      final double distance =
-          (prefs.getDouble(_prefHazardAlertDistanceCm) ??
-                  _hazardAlertDistanceMaxCm)
-              .clamp(_hazardAlertDistanceMinCm, _hazardAlertDistanceMaxCm)
-              .toDouble();
+      // 방향별 값이 없으면 예전 단일 거리(모든 방향 공통 상한)를 기본값과 비교해 옮겨 쓴다.
+      final double? legacyDistance = prefs.getDouble(_prefHazardAlertDistanceCm);
+      final Map<String, double> distances = <String, double>{
+        for (final MapEntry<String, double> entry
+            in _hazardDirectionDefaultCm.entries)
+          entry.key: _clampHazardDistance(
+            entry.key,
+            prefs.getDouble('$_prefHazardAlertDistancePrefix${entry.key}') ??
+                legacyDistance ??
+                entry.value,
+          ),
+      };
       if (!mounted) return;
       setState(() {
         _hazardAlertEnabled = enabled;
-        _hazardAlertDistanceCm = distance;
+        _hazardAlertDistanceCm.addAll(distances);
       });
       print(
-        '[HAZARD SETTING] loaded enabled=$enabled distance=${distance.round()}cm',
+        '[HAZARD SETTING] loaded enabled=$enabled ${_hazardDistanceSummary()}',
       );
     } catch (error) {
       print('위험 감지 설정 불러오기 오류: $error');
@@ -1526,7 +1546,13 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
     try {
       final SharedPreferences prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_prefHazardAlertEnabled, _hazardAlertEnabled);
-      await prefs.setDouble(_prefHazardAlertDistanceCm, _hazardAlertDistanceCm);
+      for (final MapEntry<String, double> entry
+          in _hazardAlertDistanceCm.entries) {
+        await prefs.setDouble(
+          '$_prefHazardAlertDistancePrefix${entry.key}',
+          entry.value,
+        );
+      }
     } catch (error) {
       print('위험 감지 설정 저장 오류: $error');
     }
@@ -1544,44 +1570,80 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
     unawaited(_sendHazardAlertSettingsToPi());
   }
 
-  void _setHazardAlertDistance(double distanceCm) {
-    final double clamped = distanceCm
-        .clamp(_hazardAlertDistanceMinCm, _hazardAlertDistanceMaxCm)
+  /// 1cm 단위로 반올림하고 [최소 10cm, 그 방향 기본값] 안으로 맞춘다.
+  double _clampHazardDistance(String direction, double distanceCm) {
+    return distanceCm
+        .roundToDouble()
+        .clamp(_hazardAlertDistanceMinCm, _hazardDirectionDefaultCm[direction]!)
         .toDouble();
+  }
+
+  /// 슬라이더를 끄는 중에는 화면 값만 바꾸고, 손을 뗄 때 [_commitHazardAlertDistance]로 저장·전송한다.
+  void _setHazardAlertDistance(String direction, double distanceCm) {
     setState(() {
-      _hazardAlertDistanceCm = clamped;
+      _hazardAlertDistanceCm[direction] =
+          _clampHazardDistance(direction, distanceCm);
     });
   }
 
-  void _commitHazardAlertDistance(double distanceCm) {
-    _setHazardAlertDistance(distanceCm);
-    print('[HAZARD SETTING] distance=${_hazardAlertDistanceCm.round()}cm');
+  void _commitHazardAlertDistance(String direction, double distanceCm) {
+    _setHazardAlertDistance(direction, distanceCm);
+    print('[HAZARD SETTING] ${_hazardDistanceSummary()}');
     unawaited(_saveHazardAlertSettings());
     unawaited(_sendHazardAlertSettingsToPi());
   }
 
-  /// +/- 버튼: 10cm 단위로 바꾸고 바뀐 값을 음성으로 읽어 준다.
-  void _stepHazardAlertDistance(double deltaCm, {bool resetToDefault = false}) {
-    final double next = resetToDefault
-        ? _hazardAlertDistanceMaxCm
-        : _hazardAlertDistanceCm + deltaCm;
-    _commitHazardAlertDistance(next);
-    final String spoken = _isHazardDistanceLimited
-        ? '위험 안내 거리 ${_hazardAlertDistanceCm.round()}센티미터'
-        : '위험 안내 거리를 지팡이 기본 기준으로 되돌렸습니다.';
-    unawaited(_ttsService.speak(spoken));
+  /// +/- 버튼·직접 입력·되돌리기: 값을 적용하고 바뀐 값을 음성으로 읽어 준다.
+  void _changeHazardAlertDistance(String direction, double distanceCm) {
+    _commitHazardAlertDistance(direction, distanceCm);
+    unawaited(_ttsService.speak(_hazardDistanceSpokenText(direction)));
+  }
+
+  void _resetAllHazardAlertDistances() {
+    setState(() {
+      _hazardAlertDistanceCm.addAll(_hazardDirectionDefaultCm);
+    });
+    print('[HAZARD SETTING] reset ${_hazardDistanceSummary()}');
+    unawaited(_saveHazardAlertSettings());
+    unawaited(_sendHazardAlertSettingsToPi());
+    unawaited(_ttsService.speak('위험 안내 거리를 모두 지팡이 기본 기준으로 되돌렸습니다.'));
+  }
+
+  String _hazardDistanceSpokenText(String direction) {
+    final String label = _hazardDirectionLabels[direction]!;
+    final int distance = _hazardAlertDistanceCm[direction]!.round();
+    return _isHazardDirectionLimited(direction)
+        ? '$label 위험 안내 거리 $distance센티미터'
+        : '$label 위험 안내 거리를 기본 기준 $distance센티미터로 되돌렸습니다.';
+  }
+
+  /// 숫자를 직접 입력받아 그 방향의 거리로 적용한다.
+  Future<void> _promptHazardAlertDistance(String direction) async {
+    final int? input = await showDialog<int>(
+      context: context,
+      builder: (BuildContext context) => _HazardDistanceInputDialog(
+        label: _hazardDirectionLabels[direction]!,
+        initialCm: _hazardAlertDistanceCm[direction]!.round(),
+        minCm: _hazardAlertDistanceMinCm.round(),
+        maxCm: _hazardDirectionDefaultCm[direction]!.round(),
+      ),
+    );
+    if (input == null || !mounted) return;
+    _changeHazardAlertDistance(direction, input.toDouble());
   }
 
   /// 현재 위험 감지 설정을 지팡이(Raspberry Pi)에 BLE 명령으로 보낸다.
-  /// 거리 → 켜짐/꺼짐 순서로 보내므로 마지막 응답이 두 값을 모두 반영한다.
+  /// 방향별 거리 → 켜짐/꺼짐 순서로 보내므로 마지막 응답이 모든 값을 반영한다.
   Future<void> _sendHazardAlertSettingsToPi() async {
     if (!_isBleConnected || _bleCharacteristic == null) return;
 
-    final String distanceCommand = _isHazardDistanceLimited
-        ? 'HAZARD:DIST:${_hazardAlertDistanceCm.round()}'
-        : 'HAZARD:DIST:DEFAULT';
-    final String enableCommand =
-        _hazardAlertEnabled ? 'HAZARD:ON' : 'HAZARD:OFF';
+    final List<String> commands = <String>[
+      for (final String direction in _hazardDirectionDefaultCm.keys)
+        _isHazardDirectionLimited(direction)
+            ? 'HAZARD:DIST:$direction:${_hazardAlertDistanceCm[direction]!.round()}'
+            : 'HAZARD:DIST:$direction:DEFAULT',
+      _hazardAlertEnabled ? 'HAZARD:ON' : 'HAZARD:OFF',
+    ];
 
     if (mounted) {
       setState(() {
@@ -1590,10 +1652,10 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
     }
 
     try {
-      await _writeBleTextQueued(distanceCommand);
-      print('[APP -> PI] $distanceCommand');
-      await _writeBleTextQueued(enableCommand);
-      print('[APP -> PI] $enableCommand');
+      for (final String command in commands) {
+        await _writeBleTextQueued(command);
+        print('[APP -> PI] $command');
+      }
     } catch (error) {
       print('위험 감지 설정 전송 오류: $error');
       if (mounted) {
@@ -1604,36 +1666,72 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
     }
   }
 
-  /// 지팡이가 보낸 {"type":"hazard_setting","enabled":..,"max_distance_cm":..} 처리
+  /// 지팡이가 보낸 {"type":"hazard_setting","enabled":..,"thresholds_cm":{"FRONT":..,"SIDE":..,"UPPER":..}} 처리
   void _handleHazardSettingAck(Map<String, dynamic> data) {
     final bool enabled = data['enabled'] == true;
-    final dynamic rawDistance = data['max_distance_cm'];
-    final num? distance = rawDistance is num
-        ? rawDistance
-        : num.tryParse(rawDistance?.toString() ?? '');
+    final dynamic rawThresholds = data['thresholds_cm'];
+    final String thresholdsText =
+        rawThresholds is Map ? _formatHazardThresholds(rawThresholds) : '';
 
     final String label;
     if (!enabled) {
       label = '지팡이 적용됨 · 위험 감지 꺼짐 (진동 경고 없음)';
-    } else if (distance == null) {
-      label = '지팡이 적용됨 · 기본 기준으로 감지 중';
+    } else if (rawThresholds is! Map) {
+      // 방향별 거리 명령을 모르는 예전 지팡이 코드. 방향별 거리는 앱의 화면·음성 안내에만 적용된다.
+      label = '지팡이 코드 업데이트 필요 · 방향별 거리는 앱 안내에만 적용 중';
     } else {
-      label = '지팡이 적용됨 · ${distance.round()}cm 이내만 감지 중';
+      label = '지팡이 적용됨 · $thresholdsText 이내 감지 중';
     }
 
-    print('[PI -> APP] hazard_setting enabled=$enabled max=$distance');
+    print('[PI -> APP] hazard_setting enabled=$enabled thresholds=$rawThresholds');
     if (!mounted) return;
     setState(() {
       _piHazardSettingStatus = label;
     });
   }
 
-  bool get _isHazardDistanceLimited =>
-      _hazardAlertDistanceCm < _hazardAlertDistanceMaxCm;
+  /// {"FRONT":120,"SIDE":75,"UPPER":200} → "정면 120 · 양쪽 75 · 위쪽 200cm"
+  String _formatHazardThresholds(Map<dynamic, dynamic> thresholds) {
+    final List<String> parts = <String>[];
+    for (final String direction in _hazardDirectionDefaultCm.keys) {
+      final dynamic raw = thresholds[direction];
+      final num? value = raw is num ? raw : num.tryParse(raw?.toString() ?? '');
+      if (value != null) {
+        parts.add('${_hazardDirectionLabels[direction]} ${value.round()}');
+      }
+    }
+    return parts.isEmpty ? '' : '${parts.join(' · ')}cm';
+  }
 
-  String _hazardAlertDistanceLabel() {
-    if (!_isHazardDistanceLimited) return '지팡이 기본 기준';
-    return '${_hazardAlertDistanceCm.round()}cm 이내';
+  bool _isHazardDirectionLimited(String direction) =>
+      _hazardAlertDistanceCm[direction]! < _hazardDirectionDefaultCm[direction]!;
+
+  bool get _isHazardDistanceLimited =>
+      _hazardDirectionDefaultCm.keys.any(_isHazardDirectionLimited);
+
+  String _hazardDistanceSummary() {
+    return _hazardDirectionDefaultCm.keys
+        .map((String direction) =>
+            '$direction=${_hazardAlertDistanceCm[direction]!.round()}cm')
+        .join(' ');
+  }
+
+  /// 지팡이가 보낸 위치 이름(왼쪽/정면/오른쪽/위쪽)을 거리 설정 방향(FRONT/SIDE/UPPER)으로 바꾼다.
+  String? _hazardDirectionOf(String position) {
+    switch (position.trim().toUpperCase()) {
+      case '정면':
+      case 'FRONT':
+        return 'FRONT';
+      case '왼쪽':
+      case '오른쪽':
+      case 'LEFT':
+      case 'RIGHT':
+        return 'SIDE';
+      case '위쪽':
+      case 'UPPER':
+        return 'UPPER';
+    }
+    return null;
   }
 
   /// 위험 표시를 즉시 내리고, 상태 카드가 위험 문구를 들고 있으면 중립 문구로 바꾼다.
@@ -1653,7 +1751,7 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
   /// 지팡이가 보낸 hazard 패킷에 앱의 위험 감지 설정을 적용한다.
   /// - 안내가 꺼져 있으면 null을 돌려 패킷을 무시한다. 단, 화면에 위험이 남아 있으면
   ///   한 번 '해제' 패킷으로 바꿔 표시를 내린다.
-  /// - 거리 상한이 있으면 그 거리 이내의 위치만 남기고, 하나도 없으면 '해제'로 바꾼다.
+  /// - 방향별 거리를 줄였으면 그 거리 이내의 위치만 남기고, 하나도 없으면 '해제'로 바꾼다.
   Map<String, dynamic>? _applyHazardAlertSettings(Map<String, dynamic> data) {
     final String state =
         data['state']?.toString().trim().toLowerCase() ?? 'detected';
@@ -1686,8 +1784,11 @@ class _VoiceCommandPageState extends State<VoiceCommandPage> with WidgetsBinding
       final double? distance = raw is num
           ? raw.toDouble()
           : double.tryParse(raw?.toString() ?? '');
-      // 거리값이 없는 위치는 판단할 수 없으므로 지팡이 판정을 그대로 믿는다.
-      if (distance == null || distance <= _hazardAlertDistanceCm) {
+      final String? direction = _hazardDirectionOf(positions[index]);
+      // 거리값이 없거나 방향을 알 수 없는 위치는 판단할 수 없으므로 지팡이 판정을 그대로 믿는다.
+      if (distance == null ||
+          direction == null ||
+          distance <= _hazardAlertDistanceCm[direction]!) {
         keptPositions.add(positions[index]);
         if (distance != null) keptDistances.add(distance);
       }
@@ -4129,10 +4230,15 @@ $userText
         if (arg == 'ON') return '위험 감지 켜기';
         if (arg == 'GET') return '위험 감지 설정 조회';
         if (arg.startsWith('DIST:')) {
-          final String value = arg.substring(5).trim();
+          // DIST:FRONT:120 처럼 방향이 붙으면 그 방향 이름을 앞에 붙인다.
+          final List<String> parts = arg.substring(5).split(':');
+          final String value = parts.last.trim();
+          final String label = parts.length > 1
+              ? '${_hazardDirectionLabels[parts.first.trim()] ?? parts.first} '
+              : '';
           return value == 'DEFAULT'
-              ? '위험 감지 거리를 기본 기준으로'
-              : '위험 감지 거리 ${value}cm 이내로';
+              ? '$label위험 감지 거리를 기본 기준으로'
+              : '$label위험 감지 거리 ${value}cm 이내로';
         }
       }
       return raw;
@@ -4183,9 +4289,9 @@ $userText
         return '진동 모터 ${_navigationMotorLabel(action)} · $state';
       case 'hazard_setting':
         final bool enabled = json['enabled'] == true;
-        final dynamic max = json['max_distance_cm'];
+        final dynamic thresholds = json['thresholds_cm'];
         return '위험 감지 설정 적용됨: ${enabled ? '켜짐' : '꺼짐'}'
-            '${max is num ? ', ${max.round()}cm 이내' : ', 기본 기준'}';
+            '${thresholds is Map ? ', ${_formatHazardThresholds(thresholds)} 이내' : ''}';
       case 'object_classes':
         if (json['state']?.toString() == 'not_ready') return '물건 목록 아직 준비 안 됨';
         return '찾을 수 있는 물건 목록 전송 시작 (${json['total']}묶음)';
@@ -8806,102 +8912,37 @@ $userText
             ),
           ),
           const SizedBox(height: 16),
-          Row(
-            children: [
-              const Expanded(
-                child: Text(
-                  '안내 거리',
-                  style: TextStyle(
-                    fontSize: 15,
-                    fontWeight: FontWeight.w800,
-                    color: Color(0xFF202329),
-                  ),
-                ),
-              ),
-              Text(
-                _hazardAlertDistanceLabel(),
-                style: TextStyle(
-                  fontSize: 14,
-                  fontWeight: FontWeight.w900,
-                  color: _hazardAlertEnabled ? accent : muted,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: <Widget>[
-              Expanded(
-                child: SizedBox(
-                  height: 56,
-                  child: OutlinedButton(
-                    onPressed: _hazardAlertEnabled &&
-                            _hazardAlertDistanceCm > _hazardAlertDistanceMinCm
-                        ? () => _stepHazardAlertDistance(-10)
-                        : null,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: accent,
-                      side: const BorderSide(color: Color(0xFFC9D6F2), width: 1.5),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                    ),
-                    child: const Text(
-                      '− 10cm',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: SizedBox(
-                  height: 56,
-                  child: OutlinedButton(
-                    onPressed: _hazardAlertEnabled &&
-                            _hazardAlertDistanceCm < _hazardAlertDistanceMaxCm
-                        ? () => _stepHazardAlertDistance(10)
-                        : null,
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: accent,
-                      side: const BorderSide(color: Color(0xFFC9D6F2), width: 1.5),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14),
-                      ),
-                    ),
-                    child: const Text(
-                      '+ 10cm',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
+          for (final String direction in _hazardDirectionDefaultCm.keys) ...<Widget>[
+            if (direction != _hazardDirectionDefaultCm.keys.first)
+              const Divider(height: 26, color: Color(0xFFE8EAEE)),
+            _buildHazardDirectionControl(direction),
+          ],
           const SizedBox(height: 8),
           SizedBox(
             width: double.infinity,
             height: 44,
             child: TextButton.icon(
               onPressed: _hazardAlertEnabled && _isHazardDistanceLimited
-                  ? () => _stepHazardAlertDistance(0, resetToDefault: true)
+                  ? _resetAllHazardAlertDistances
                   : null,
               icon: const Icon(Icons.restart_alt_rounded, size: 18),
               label: const Text(
-                '지팡이 기본 기준으로 되돌리기',
+                '모두 지팡이 기본 기준으로 되돌리기',
                 style: TextStyle(fontWeight: FontWeight.w800),
               ),
               style: TextButton.styleFrom(foregroundColor: const Color(0xFF555B65)),
             ),
           ),
           const SizedBox(height: 6),
-          const Text(
-            '지팡이 기본 기준은 정면 150cm, 양옆 75cm, 위쪽 200cm입니다. '
-            '− 10cm 버튼으로 거리를 줄이면 그보다 가까운 장애물만 안내하고, '
-            '"지팡이 기본 기준으로 되돌리기"를 누르면 지팡이 기준을 그대로 씁니다. '
+          Text(
+            '지팡이 기본 기준은 '
+            '${_hazardDirectionDefaultCm.entries.map((MapEntry<String, double> entry) => '${_hazardDirectionLabels[entry.key]} ${entry.value.round()}cm').join(', ')}'
+            '입니다. 방향마다 바를 밀거나 ± 10cm 버튼, "직접 입력"으로 '
+            '${_hazardAlertDistanceMinCm.round()}cm부터 1cm 단위로 줄일 수 있고, '
+            '줄인 거리보다 가까운 장애물만 안내하고 진동합니다. '
             '실내처럼 장애물이 늘 가까운 곳에서는 거리를 줄이거나 안내를 꺼서 '
             '물건 찾기 음성이 묻히지 않게 할 수 있습니다.',
-            style: TextStyle(
+            style: const TextStyle(
               fontSize: 12,
               height: 1.45,
               fontWeight: FontWeight.w600,
@@ -8928,6 +8969,129 @@ $userText
           ),
         ],
       ),
+    );
+  }
+
+  /// 한 방향(정면/양쪽/위쪽)의 안내 거리: 바(1cm 단위), − 10cm / 직접 입력 / + 10cm 버튼.
+  Widget _buildHazardDirectionControl(String direction) {
+    const Color accent = Color(0xFF155EEF);
+    const Color muted = Color(0xFF747A84);
+    final String label = _hazardDirectionLabels[direction]!;
+    final double maxCm = _hazardDirectionDefaultCm[direction]!;
+    final double distance = _hazardAlertDistanceCm[direction]!;
+    final bool enabled = _hazardAlertEnabled;
+
+    final ButtonStyle buttonStyle = OutlinedButton.styleFrom(
+      foregroundColor: accent,
+      side: const BorderSide(color: Color(0xFFC9D6F2), width: 1.5),
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(14),
+      ),
+    );
+    const TextStyle buttonTextStyle =
+        TextStyle(fontSize: 16, fontWeight: FontWeight.w900);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: Text(
+                '$label 안내 거리',
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w800,
+                  color: Color(0xFF202329),
+                ),
+              ),
+            ),
+            Text(
+              _isHazardDirectionLimited(direction)
+                  ? '${distance.round()}cm 이내'
+                  : '기본 ${maxCm.round()}cm',
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.w900,
+                color: enabled ? accent : muted,
+              ),
+            ),
+          ],
+        ),
+        Semantics(
+          label: '$label 위험 안내 거리',
+          child: Slider(
+            value: distance,
+            min: _hazardAlertDistanceMinCm,
+            max: maxCm,
+            divisions: (maxCm - _hazardAlertDistanceMinCm).round(),
+            label: '${distance.round()}cm',
+            semanticFormatterCallback: (double value) => '${value.round()}센티미터',
+            activeColor: accent,
+            onChanged: enabled
+                ? (double value) => _setHazardAlertDistance(direction, value)
+                : null,
+            onChangeEnd: enabled
+                ? (double value) => _commitHazardAlertDistance(direction, value)
+                : null,
+          ),
+        ),
+        Row(
+          children: <Widget>[
+            Expanded(
+              child: SizedBox(
+                height: 48,
+                child: OutlinedButton(
+                  onPressed: enabled && distance > _hazardAlertDistanceMinCm
+                      ? () => _changeHazardAlertDistance(direction, distance - 10)
+                      : null,
+                  style: buttonStyle,
+                  child: Text(
+                    '− 10cm',
+                    semanticsLabel: '$label 거리 10센티미터 줄이기',
+                    style: buttonTextStyle,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: SizedBox(
+                height: 48,
+                child: OutlinedButton(
+                  onPressed: enabled
+                      ? () => _promptHazardAlertDistance(direction)
+                      : null,
+                  style: buttonStyle,
+                  child: Text(
+                    '직접 입력',
+                    semanticsLabel: '$label 거리 직접 입력',
+                    style: buttonTextStyle,
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: SizedBox(
+                height: 48,
+                child: OutlinedButton(
+                  onPressed: enabled && distance < maxCm
+                      ? () => _changeHazardAlertDistance(direction, distance + 10)
+                      : null,
+                  style: buttonStyle,
+                  child: Text(
+                    '+ 10cm',
+                    semanticsLabel: '$label 거리 10센티미터 늘리기',
+                    style: buttonTextStyle,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -9459,6 +9623,94 @@ class _PlaceInputDialogState extends State<_PlaceInputDialog> {
                     'keyword': _keywordController.text.trim(),
                   }),
           child: const Text('저장'),
+        ),
+      ],
+    );
+  }
+}
+
+/// 위험 안내 거리(cm) 직접 입력 다이얼로그. 범위를 벗어나면 적용 버튼이 눌리지 않는다.
+/// 컨트롤러 수명을 다이얼로그와 같이 가져간다(`_PlaceInputDialog`와 같은 이유).
+class _HazardDistanceInputDialog extends StatefulWidget {
+  final String label;
+  final int initialCm;
+  final int minCm;
+  final int maxCm;
+
+  const _HazardDistanceInputDialog({
+    required this.label,
+    required this.initialCm,
+    required this.minCm,
+    required this.maxCm,
+  });
+
+  @override
+  State<_HazardDistanceInputDialog> createState() =>
+      _HazardDistanceInputDialogState();
+}
+
+class _HazardDistanceInputDialogState extends State<_HazardDistanceInputDialog> {
+  // 처음 값을 전체 선택해 두어 바로 새 숫자를 치면 덮어써진다.
+  late final TextEditingController _controller = TextEditingController(
+    text: '${widget.initialCm}',
+  )..selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: '${widget.initialCm}'.length,
+    );
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  int? get _value {
+    final int? parsed = int.tryParse(_controller.text.trim());
+    if (parsed == null || parsed < widget.minCm || parsed > widget.maxCm) {
+      return null;
+    }
+    return parsed;
+  }
+
+  void _submit() {
+    final int? value = _value;
+    if (value != null) Navigator.of(context).pop(value);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final String range = '${widget.minCm}~${widget.maxCm}cm';
+    final bool invalid = _controller.text.trim().isNotEmpty && _value == null;
+
+    return AlertDialog(
+      title: Text('${widget.label} 위험 안내 거리'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        keyboardType: TextInputType.number,
+        inputFormatters: <TextInputFormatter>[
+          FilteringTextInputFormatter.digitsOnly,
+          LengthLimitingTextInputFormatter(3),
+        ],
+        textInputAction: TextInputAction.done,
+        decoration: InputDecoration(
+          labelText: '거리',
+          suffixText: 'cm',
+          helperText: '$range 사이 숫자 (${widget.maxCm}cm = 지팡이 기본 기준)',
+          helperMaxLines: 2,
+          errorText: invalid ? '$range 사이로 입력하세요' : null,
+        ),
+        onChanged: (_) => setState(() {}),
+        onSubmitted: (_) => _submit(),
+      ),
+      actions: <Widget>[
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('취소'),
+        ),
+        FilledButton(
+          onPressed: _value == null ? null : _submit,
+          child: const Text('적용'),
         ),
       ],
     );

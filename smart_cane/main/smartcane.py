@@ -224,6 +224,35 @@ TOF_POSITION_KO = {
     "UPPER": "위쪽",
 }
 
+# 앱에서 위험 감지 거리를 줄일 때 쓰는 방향 묶음.
+# LEFT/RIGHT는 "양쪽(SIDE)" 하나의 값으로 같이 조절한다.
+HAZARD_DISTANCE_GROUPS = ("FRONT", "SIDE", "UPPER")
+HAZARD_GROUP_BY_POSITION = {
+    "LEFT": "SIDE",
+    "FRONT": "FRONT",
+    "RIGHT": "SIDE",
+    "UPPER": "UPPER",
+}
+HAZARD_DISTANCE_LABEL_KO = {
+    "FRONT": "정면",
+    "SIDE": "양쪽",
+    "UPPER": "위쪽",
+}
+
+# 묶음별 기본 위험 거리 = 그 묶음 센서 threshold_cm 중 가장 큰 값
+# (현재 정면 150cm, 양쪽 75cm, 위쪽 200cm). 앱은 이 값보다 줄이는 것만 할 수 있다.
+HAZARD_DEFAULT_DISTANCE_CM = {
+    group: max(
+        int(sensor_info["threshold_cm"])
+        for sensor_info in TOF_SENSOR_LAYOUT
+        if HAZARD_GROUP_BY_POSITION[sensor_info["position"]] == group
+    )
+    for group in HAZARD_DISTANCE_GROUPS
+}
+
+# 10cm 미만은 센서 오차 범위라 의미가 없다.
+HAZARD_MIN_DISTANCE_CM = 10
+
 TOF_HAZARD_BLE_REPEAT_SEC = 5.0
 TOF_HAZARD_CLEAR_READS = 3
 
@@ -237,6 +266,7 @@ TOF_HAZARD_CLEAR_READS = 3
 # LEFT/RIGHT 75cm: 0~25cm 3 pulses, 26~50cm 2 pulses, 51~75cm 1 pulse
 # FRONT 150cm: 0~50cm 3 pulses, 51~100cm 2 pulses, 101~150cm 1 pulse
 # UPPER 200cm: 0~66cm 3 pulses, 67~133cm 2 pulses, 134~200cm 1 pulse
+# 앱에서 방향별 거리를 줄이면 줄인 거리를 기준으로 같은 1/3 비율을 쓴다.
 TOF_HAZARD_PULSE_ON_SEC = 0.22
 TOF_HAZARD_PULSE_GAP_SEC = 0.18
 TOF_HAZARD_CYCLE_GAP_SEC = {
@@ -269,10 +299,15 @@ tof_hazard_motor_on = False
 tof_hazard_next_transition_time = 0.0
 
 # 앱(설정 탭)에서 BLE로 바꾸는 위험 감지 옵션
-# HAZARD:ON / HAZARD:OFF      -> hazard_enabled
-# HAZARD:DIST:<cm> / DEFAULT  -> hazard_max_distance_cm (None이면 센서별 기본 threshold)
+# HAZARD:ON / HAZARD:OFF                    -> hazard_enabled
+# HAZARD:DIST:<FRONT|SIDE|UPPER>:<cm|DEFAULT> -> 그 방향의 hazard_distance_limits_cm
+# HAZARD:DIST:<cm|DEFAULT>                  -> 세 방향 모두 (구버전 앱 호환)
+# 값이 None이면 그 방향은 센서별 기본 threshold를 그대로 쓴다.
 hazard_enabled = True
-hazard_max_distance_cm = None
+hazard_distance_limits_cm = {
+    group: None
+    for group in HAZARD_DISTANCE_GROUPS
+}
 
 
 # =========================================================
@@ -907,9 +942,12 @@ def get_tof_hazard_detections():
             continue
 
         threshold = float(sensor_info["threshold_cm"])
-        # 앱에서 거리 상한을 보냈으면 센서 기본값보다 가까운 쪽을 쓴다.
-        if hazard_max_distance_cm is not None:
-            threshold = min(threshold, float(hazard_max_distance_cm))
+        # 앱에서 이 방향의 거리를 줄였으면 센서 기본값보다 가까운 쪽을 쓴다.
+        limit = hazard_distance_limits_cm.get(
+            HAZARD_GROUP_BY_POSITION.get(sensor_info["position"])
+        )
+        if limit is not None:
+            threshold = min(threshold, float(limit))
         if distance <= threshold:
             detections.append(
                 {
@@ -1124,6 +1162,32 @@ def clear_tof_hazard(reason):
     )
 
 
+def get_hazard_thresholds_cm():
+    """방향 묶음별로 지금 실제로 쓰는 위험 거리(cm). 줄이지 않은 방향은 기본값."""
+    return {
+        group: (
+            hazard_distance_limits_cm[group]
+            if hazard_distance_limits_cm[group] is not None
+            else HAZARD_DEFAULT_DISTANCE_CM[group]
+        )
+        for group in HAZARD_DISTANCE_GROUPS
+    }
+
+
+def set_hazard_distance_limit(group, distance_cm):
+    """distance_cm이 None이거나 기본값 이상이면 기본값으로 되돌리고, 아니면 최소 10cm로 줄인다."""
+    if (
+        distance_cm is None
+        or distance_cm >= HAZARD_DEFAULT_DISTANCE_CM[group]
+    ):
+        hazard_distance_limits_cm[group] = None
+    else:
+        hazard_distance_limits_cm[group] = max(
+            HAZARD_MIN_DISTANCE_CM,
+            distance_cm
+        )
+
+
 def send_hazard_setting():
     """Report the current hazard options to the app."""
     if smartcane_characteristic is None:
@@ -1133,15 +1197,19 @@ def send_hazard_setting():
         {
             "type": "hazard_setting",
             "enabled": hazard_enabled,
-            "max_distance_cm": hazard_max_distance_cm,
+            # 방향별로 실제 적용 중인 거리. 예: {"FRONT":120,"SIDE":75,"UPPER":200}
+            "thresholds_cm": get_hazard_thresholds_cm(),
         }
     )
 
 
 def handle_hazard_command(argument):
-    """HAZARD:ON | HAZARD:OFF | HAZARD:DIST:<cm> | HAZARD:DIST:DEFAULT | HAZARD:GET"""
+    """
+    HAZARD:ON | HAZARD:OFF | HAZARD:GET
+    HAZARD:DIST:<FRONT|SIDE|UPPER>:<cm|DEFAULT>  (한 방향만)
+    HAZARD:DIST:<cm|DEFAULT>                    (세 방향 모두)
+    """
     global hazard_enabled
-    global hazard_max_distance_cm
 
     argument = argument.strip().upper()
 
@@ -1155,19 +1223,31 @@ def handle_hazard_command(argument):
 
     elif argument.startswith("DIST:"):
         value = argument.split(":", 1)[1].strip()
+        groups = HAZARD_DISTANCE_GROUPS
+
+        if ":" in value:
+            group, value = [
+                part.strip()
+                for part in value.split(":", 1)
+            ]
+            if group not in HAZARD_DISTANCE_GROUPS:
+                print("Invalid HAZARD direction:", group)
+                send_hazard_setting()
+                return
+            groups = (group,)
 
         if value in ("", "DEFAULT", "MAX", "0"):
-            hazard_max_distance_cm = None
+            parsed = None
         else:
             try:
-                parsed = int(float(value))
+                parsed = int(round(float(value)))
             except ValueError:
                 print("Invalid HAZARD distance:", value)
                 send_hazard_setting()
                 return
 
-            # 10cm 미만은 센서 오차 범위라 의미가 없고, 400cm는 VL53L1X 최대치다.
-            hazard_max_distance_cm = max(10, min(400, parsed))
+        for group in groups:
+            set_hazard_distance_limit(group, parsed)
 
     elif argument == "GET":
         pass
@@ -1180,7 +1260,10 @@ def handle_hazard_command(argument):
     print(
         "[HAZARD] Setting:",
         "enabled=" + str(hazard_enabled),
-        "max_distance_cm=" + str(hazard_max_distance_cm),
+        " ".join(
+            HAZARD_DISTANCE_LABEL_KO[group] + "=" + str(distance_cm) + "cm"
+            for group, distance_cm in get_hazard_thresholds_cm().items()
+        ),
     )
     send_hazard_setting()
 
